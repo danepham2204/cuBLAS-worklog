@@ -1,4 +1,4 @@
-%%cuda
+%%writefile 09_Async_Pipeline.cu
 // Kernel 9 - Producer/Consumer Pipeline + Epilogue Shared Memory Staging
 //
 // Progression from version 8:
@@ -158,7 +158,7 @@ __global__ void sgemm_tensor_core_pipeline_epilogue(
 #endif
 }
 
-#include "runner_half.h"
+#include "/content/runner_half.h"
 
 void run_09_tensor_core_pipeline_epilogue(const __half* d_A, const __half* d_B, float* d_C, int M, int N, int K) {
     dim3 block(THREADS_PER_BLOCK);

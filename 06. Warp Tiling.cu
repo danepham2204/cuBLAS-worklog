@@ -1,4 +1,4 @@
-%%cuda
+%%writefile 06_Warp_Tiling.cu
 // kiểu 5 là mỗi thread độc lập 1 block tile lớn. 
 // Mỗi block tính tile 128 x 128
 // Mỗi thread tính 8 x 8 = 64 output
@@ -167,7 +167,7 @@ __global__ void sgemm_warp_tiled(
     }
 }
 
-#include "runner.h"
+#include "/content/runner.h"
 
 void run_06_warp_tiled(const float* d_A, const float* d_B, float* d_C, int M, int N, int K) {
     dim3 block(THREADS_PER_BLOCK);

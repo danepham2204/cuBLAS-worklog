@@ -13,9 +13,9 @@ The following table documents the raw GFLOP/s and execution times of the kernels
 | :--- | :--- | :--- | :--- | :--- |
 | **01. Naive SGEMM** | 36.896 | 465.63 | 1.83e-04 | ✅ Pass |
 | **02. Shared Memory Tiling** | 20.195 | 850.68 | 1.83e-04 | ✅ Pass |
-| **03. Register Tiling (1D)** | - | - | - | ⏳ Pending |
-| **04. Register Tiling (2D)** | - | - | - | ⏳ Pending |
-| **05. Vectorized Register Tiling**| - | - | - | ⏳ Pending |
+| **03. Register Tiling (1D)** | 16.164 | 1062.82 | 1.83e-04 | ✅ Pass |
+| **04. Register Tiling (2D)** | 12.473 | 1377.36 | 1.83e-04 | ✅ Pass |
+| **05. Vectorized Register Tiling**| 5.199 | 3304.42 | 1.83e-04 | ✅ Pass |
 | **06. Warp Tiling** | - | - | - | ⏳ Pending |
 | **07. Tensor Cores (WMMA)** | - | - | - | ⏳ Pending |
 | **08. Tensor Cores SMEM WMMA** | - | - | - | ⏳ Pending |

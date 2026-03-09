@@ -1,4 +1,4 @@
-%%cuda
+%%writefile 08_Tensor_Cores_Smem_WMMA.cu
 // Kernel 8 - Tensor Cores with Shared Memory WMMA
 //
 // Progression from version 7:
@@ -122,7 +122,7 @@ __global__ void sgemm_tensor_core_smem_wmma(
 #endif
 }
 
-#include "runner_half.h"
+#include "/content/runner_half.h"
 
 void run_08_tensor_core_smem_wmma(const __half* d_A, const __half* d_B, float* d_C, int M, int N, int K) {
     dim3 block(THREADS_PER_BLOCK);

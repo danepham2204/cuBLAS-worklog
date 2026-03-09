@@ -1,4 +1,4 @@
-%%cuda
+%%writefile 07_Tensor_Cores.cu
 // run with nvcc4jupyter extension
 // Kernel 7 - Tensor Cores
 //
@@ -115,7 +115,7 @@ __global__ void sgemm_tensor_core_wmma(
 #endif
 }
 
-#include "runner_half.h"
+#include "/content/runner_half.h"
 
 void run_07_tensor_core_wmma(const __half* d_A, const __half* d_B, float* d_C, int M, int N, int K) {
     dim3 block(THREADS_PER_BLOCK);

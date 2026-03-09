@@ -1,4 +1,5 @@
-%%cuda
+%%writefile 04_Register_Tiling_2_Side.cu
+#include "/content/runner.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>

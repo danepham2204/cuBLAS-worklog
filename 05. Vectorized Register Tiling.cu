@@ -1,5 +1,6 @@
-%%cuda
+%%writefile 05_Vectorized_Register_Tiling.cu
 // run with nvcc4jupyter extension
+#include "/content/runner.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
@@ -76,7 +77,7 @@ __global__ void sgemm_vectorized_kernel(float* A, float* B, float* C, int M, int
     }
 }
 
-#include "runner.h"
+#include "/content/runner.h"
 
 void run_05_vectorized(const float* d_A, const float* d_B, float* d_C, int M, int N, int K) {
     dim3 blockDim(BN / TN, BM / TM);
