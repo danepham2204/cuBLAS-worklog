@@ -14,6 +14,10 @@ Disclaimer: The primary academic value of this work is not solely in yielding a 
 ![NVIDIA H100 GPU](img/SXM5-design-detail.svg)
 
 
+Key notes:
++ Kernels are written from the perspective of a single thread.
++ All threads in grid running or executing the same kernel function
+
 ## Performance Tracking
 
 The following table documents the raw GFLOP/s and execution times of the kernels benchmarking a matrix of $2048 \times 2048 \times 2048$.
@@ -34,19 +38,17 @@ The following table documents the raw GFLOP/s and execution times of the kernels
 
 ### Compilation & Infrastructure — The NVCC Story
 
-One thing that became clear while working on this project is that `nvcc` is not just a compiler — it is a **multi-stage compilation driver** that quietly orchestrates several very different tools. Understanding this unlocked why a missing flag could cause a kernel to silently produce completely wrong results.
+One thing that became clear while working on this project is that `nvcc` is not just a compiler — it is a **multi-stage compilation driver** that quietly orchestrates several very different tools. Understanding this unlocked why a missing flag could cause a kernel to silently produce completely wrong results. This stage of compiling through `nvcc` is very important to understand:
 
-When you run `nvcc -O3 -arch=sm_75 -lcublas kernel.cu -o kernel`, here is what actually happens:
++ **Stage 1 — Split.** NVCC splits the `.cu` file into two worlds. Host code (`main()`, memory allocation, kernel launches) is handed off to your system C++ compiler (clang or gcc). Device code (`__global__`, `__device__` functions) is routed to NVIDIA's own compiler backend. This split is why `#if defined(__CUDA_ARCH__)` guards exist — `__CUDA_ARCH__` is only defined during the device compilation pass, so host-side compilation never tries to process WMMA fragment types it has no concept of.
 
-**Stage 1 — Split.** NVCC splits the `.cu` file into two worlds. Host code (`main()`, memory allocation, kernel launches) is handed off to your system C++ compiler (clang or gcc). Device code (`__global__`, `__device__` functions) is routed to NVIDIA's own compiler backend. This split is why `#if defined(__CUDA_ARCH__)` guards exist — `__CUDA_ARCH__` is only defined during the device compilation pass, so host-side compilation never tries to process WMMA fragment types it has no concept of.
-
-**Stage 2 — PTX generation.** Device kernels compile to **PTX (Parallel Thread Execution)**, NVIDIA's architecture-neutral virtual assembly. This is where the WMMA API gets lowered:
++ **Stage 2 — PTX generation.** Device kernels compile to **PTX (Parallel Thread Execution)**, NVIDIA's architecture-neutral virtual assembly. This is where the WMMA API gets lowered:
 ```
 nvcuda::wmma::mma_sync(...)   →   wmma.mma.sync.aligned.m16n16k16.row.col.f32.f16.f16.f32
 nvcuda::wmma::load_matrix_sync →  wmma.load.a.sync.aligned.m16n16k16.global.row
 ```
 
-**Stage 3 — SASS compilation via `ptxas`.** PTX is translated to **SASS**, the real binary machine instructions the hardware executes. This is where `-arch=sm_75` becomes critical. Without it, `ptxas` defaults to sm_52 (Maxwell), which has no WMMA opcodes. The `#if __CUDA_ARCH__ >= 700` block compiles to nothing, and every benchmark call returns in `0.006 ms` reporting 2.7 PFLOP/s — a mathematically perfect empty kernel. This was the root cause of the ghost performance numbers seen in Kernels 07–09 before the flag was identified.
++ **Stage 3 — SASS compilation via `ptxas`.** PTX is translated to **SASS**, the real binary machine instructions the hardware executes. This is where `-arch=sm_75` becomes critical. Without it, `ptxas` defaults to sm_52 (Maxwell), which has no WMMA opcodes. The `#if __CUDA_ARCH__ >= 700` block compiles to nothing, and every benchmark call returns in `0.006 ms` reporting 2.7 PFLOP/s — a mathematically perfect empty kernel. This was the root cause of the ghost performance numbers seen in Kernels 07–09 before the flag was identified.
 
 **Stage 4 — Fatbinary packaging.** The final executable contains both the PTX source (for JIT compilation on future unknown GPUs) and the compiled sm_75 cubin (native code for the T4). At runtime, the CUDA driver picks the right one based on the actual hardware.
 
