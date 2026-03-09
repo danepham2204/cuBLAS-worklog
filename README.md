@@ -8,6 +8,8 @@ The progression covers memory coalescing, shared-memory tiling, register tiling,
 
 Disclaimer: The primary academic value of this work is not solely in yielding a fast kernel, but in making visible the relationships between algorithmic decomposition, GPU memory hierarchy, instruction issue behavior, arithmetic intensity, and Tensor Core utilization. It serves as both an optimization case study and a conceptual bridge from classic CUDA core programming to modern Tensor Core pipeline designs.
 
+![NVIDIA H100 GPU](img/GPU-NVIDIA-H100-SXM5.png)
+
 ## Performance Tracking
 
 The following table documents the raw GFLOP/s and execution times of the kernels benchmarking a matrix of $2048 \times 2048 \times 2048$.
