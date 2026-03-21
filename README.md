@@ -212,6 +212,8 @@ Every thread independently re-fetches data that neighboring threads also need. G
 
 ### Version 02: Shared-Memory Tiling
 
+![SMEM load title calculation](img/SMEM_LOAD_TITLE_CALCULATION.png)
+
 **Core idea**
 
 Instead of each thread fetching independently, the whole block cooperates to load a tile of `A` and a tile of `B` into fast shared memory. All threads in the block then compute from that shared tile.
