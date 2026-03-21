@@ -276,7 +276,9 @@ Each thread still computes only one output. That output requires reading `BK` el
 
 ---
 
-### Version 03: Register Tiling (1D)
+### Version 03: Thread-level Strip Tiling (1D tilling)
+
+![Thead-level String tilling](img/thread-level_tilling.png)
 
 **Core idea**
 
@@ -324,6 +326,8 @@ For `TM=8`: roughly `1.78 FLOP/SMEM load`. Fewer shared-memory reads per output 
 ---
 
 ### Version 04: Register Tiling (2D)
+
+![block level tilling](img/block-level_tilling.jpg)
 
 **Core idea**
 
@@ -381,6 +385,8 @@ High register usage can reduce occupancy (fewer warps active simultaneously), wh
 ---
 
 ### Version 05: Vectorized Register Tiling
+
+![Vectorized float4 load](img/vectorized_float4_load.jpg)
 
 **Core idea**
 
