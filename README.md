@@ -797,6 +797,7 @@ Benchmark: matrix dimensions `2048 × 2048 × 2048`.
 | **07. Tensor Cores (WMMA)**        | 7.780     | 2208.25               | 0.00e+00           | ✅ Pass |
 | **08. Tensor Cores SMEM WMMA**     | 7.052     | 2436.32               | 0.00e+00           | ✅ Pass |
 | **09. Async Pipeline WMMA**        | 6.340     | 2709.72               | 0.00e+00           | ✅ Pass |
+| **10. Vectorized TC Pipeline**     | 7.100     | 2466.00               | 0.00e+00           | ✅ Pass |
 
 ---
 
