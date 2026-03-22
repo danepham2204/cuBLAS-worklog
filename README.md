@@ -150,6 +150,7 @@ Early kernels operate at the block and thread level. Later kernels introduce war
 | **07**  | `07. Tensor Cores (Async TMA + WGMMA).cu`  | WMMA Tensor Core baseline      | Transition from scalar FMA to Tensor Cores       |
 | **08**  | `08. Tensor Cores - Shared Memory WMMA.cu` | Shared-memory staged WMMA      | Tensor Core operand reuse and feed efficiency    |
 | **09**  | `09. Async Producer–Consumer Pipeline.cu`  | Software pipelining & epilogue | Pipeline bubbles and load/compute serialization  |
+| **10**  | `10. Vectorized Tensor Core Pipeline.cu`   | Vectorized `int4` loads + `float4` epilogue | Memory instruction pressure in Tensor Core pipeline |
 
 ---
 
@@ -547,7 +548,12 @@ Global memory bandwidth: ~320 GB/s    → ~200× too slow
 
 ---
 
+**The problem comes**:
+As we see in v07: HBM → Tensor Cores. But as we know, the HBM cost so much space that make the warp need to wait until all tile loaded. How about loaded into SM first like we do in v2 ?
+
 ### Version 08: Shared-Memory Staged WMMA
+
+![Shared mem with tensor](img/sm_with_tensor_2.jpg)
 
 **Core idea**
 
@@ -599,6 +605,8 @@ v08: global loads unchanged but data is reused BN/16 times from SMEM instead of 
 ---
 
 ### Version 09: Producer-Consumer Pipeline and Epilogue Staging
+
+![Producer consumer pipeline](img/pipeline_consumer_2.jpg)
 
 **Core idea: double buffering**
 
@@ -673,6 +681,104 @@ The effectiveness depends on whether the compute time for one tile (`BM × BN ×
 - Tensor Cores for `mma_sync`
 - Shared memory for both operand staging and epilogue layout
 - LD/ST units with 128-bit vector paths for coalesced epilogue writes
+
+---
+
+### Version 10: Vectorized Tensor Core Pipeline
+
+**Core idea: reduce memory instruction count with 128-bit loads**
+
+Kernels 07–09 exposed a structural problem: Tensor Cores finish a `16×16×16` MMA in 1–2 clock cycles, then the entire warp stalls waiting for the next tile to arrive from global memory. The root cause is scalar `__half` loads — each load moves 16 bits, so filling a `32×16` A-tile requires 512 separate load instructions per warp. Version 10 replaces every scalar `__half` load with an `int4` load (128 bits = 8 `__half` per instruction), reducing load instruction count by 8×.
+
+The epilogue is also vectorized: instead of writing 4 floats per store instruction, each thread issues one `float4` store (128 bits = 4 floats), halving store instruction pressure on the global write path.
+
+**Tile and thread configuration**
+
+```
+BLOCK_WARPS_M  = 2    BLOCK_WARPS_N  = 4
+BLOCK_TILE_M   = 32   BLOCK_TILE_N   = 64   WMMA_K = 16
+THREADS_PER_BLOCK = 256  (8 warps × 32 threads)
+
+SA_VEC_COUNT = (32 × 16) / 8 = 64   int4 loads  (A tile)
+SB_VEC_COUNT = (16 × 64) / 8 = 128  int4 loads  (B tile)
+SC_VEC_COUNT = (32 × 64) / 4 = 512  float4 stores (C epilogue)
+```
+
+**Vectorized load path**
+
+```cpp
+// One int4 per thread per iteration — 8× fewer instructions than scalar
+for (int idx = tid; idx < SA_VEC_COUNT; idx += THREADS_PER_BLOCK) {
+    int flat = idx * 8;               // position in __half space
+    int row  = flat / WMMA_K;
+    int col  = flat % WMMA_K;
+    val = reinterpret_cast<const int4*>(&A[g_row * K + g_col])[0];
+    reinterpret_cast<int4*>(&sA[stage][row][col])[0] = val;
+}
+```
+
+**Double-buffered pipeline (inherited from version 09)**
+
+```
+Prefetch tile 0 → shared buffer 0
+
+for tile k = 0 .. K/WMMA_K - 1:
+    PRODUCER: load tile k+1 → shared buffer (write_stage)   // int4 vectorized
+    CONSUMER: wmma::mma_sync on tile k from shared buffer (read_stage)
+    __syncthreads()
+    swap(read_stage, write_stage)
+```
+
+**Vectorized epilogue**
+
+```cpp
+// float4 stores: 4 floats per instruction → 512 stores for the 32×64 C tile
+for (int idx = tid; idx < SC_VEC_COUNT; idx += THREADS_PER_BLOCK) {
+    float4 val = reinterpret_cast<float4*>(&sC[row][col])[0];
+    // alpha/beta scaling applied in-register before store
+    reinterpret_cast<float4*>(&C[g_row * N + g_col])[0] = val;
+}
+```
+
+**Why this approach is correct in principle**
+
+Vectorized loads are the standard technique for saturating a memory bus with high bandwidth and limited warp counts. Version 05 (pure FP32) achieved `3304 GFLOP/s` — faster than any Tensor Core kernel — precisely because `float4` loads issued 8× fewer memory transactions and kept the bus busy. The same logic applies here: fewer, wider loads reduce the occupancy of the LD/ST pipeline and leave more scheduler slots open for compute instructions.
+
+**Why the measured result is lower than version 09 (tile size constraint)**
+
+With `BLOCK_TILE_M = 32` and `BLOCK_TILE_N = 64`, the A-tile requires only **64 `int4` loads** total. With 256 threads issuing loads in parallel, each thread gets at most one load assignment per loop iteration — **75% of threads are idle** during the A-load phase. The B-tile (128 `int4` loads) is slightly better but still leaves half the threads idle.
+
+```
+A tile:  64  int4 loads,  256 threads → 3 threads per load, 192 threads idle
+B tile:  128 int4 loads,  256 threads → 2 threads per load, 128 threads idle
+```
+
+Fewer active threads per load phase means fewer in-flight memory requests at any moment, which directly reduces the GPU's ability to hide memory latency through request pipelining. The instruction count dropped 8×, but warp-level memory-level parallelism (MLP) dropped with it — and on a bandwidth-bound kernel, MLP matters more than instruction count.
+
+Measured result: `2466 GFLOP/s` vs `2709 GFLOP/s` for version 09 — approximately 9% slower.
+
+**What must change to realize the gain**
+
+The fix is to scale the tile so that all 256 threads remain busy across the vectorized load loop:
+
+```
+Target: SA_VEC_COUNT >= THREADS_PER_BLOCK = 256
+→ BLOCK_TILE_M * WMMA_K / 8 >= 256
+→ BLOCK_TILE_M >= 256 * 8 / 16 = 128
+
+Similarly for B:
+→ WMMA_K * BLOCK_TILE_N / 8 >= 256
+→ BLOCK_TILE_N >= 256 * 8 / 16 = 128
+```
+
+A `128×128` tile with `int4` loads fully occupies all 256 threads during every load phase, preserves MLP, and cuts instruction count by 8×. This is the target for version 11.
+
+**Hardware units used**
+
+- LD/ST units with 128-bit vector paths (`int4` global → shared, `float4` shared → global)
+- Tensor Cores for `wmma::mma_sync`
+- Shared memory double buffer for both operand staging and epilogue layout
+- Warp scheduler for overlapping producer loads with consumer MMA
 
 ---
 
