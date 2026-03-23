@@ -1006,7 +1006,7 @@ This is the classic **memory wall**.
 
 All kernels are evaluated under the same protocol:
 
-1. **Fixed dimensions** — standardized matrix sizes (e.g., `M=N=K=4096`) ensure caching effects are consistent across runs.
+1. **Fixed dimensions** — standardized matrix sizes (e.g., `M=N=K=2048`) ensure caching effects are consistent across runs.
 2. **Warmup runs** — cold-start anomalies are masked before timing begins.
 3. **Reference validation** — maximum absolute error is checked against cuBLAS to guarantee correctness.
 4. **Profiling** — throughput is reported in `GFLOP/s` and paired with Nsight Compute stall metrics (Memory Dependency, Execution Dependency) to explain each bottleneck.

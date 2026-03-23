@@ -3,8 +3,7 @@
 ## Environment
 - Platform: Google Colab (T4 GPU, SM75)
 - CUDA: 12.8
-- Compiler: nvcc
-
+- Compiler: nvcc=
 ---
 
 ## Part 1 — Run kernel benchmark
@@ -149,14 +148,3 @@ nvcc -O3 -arch=sm_75 ...      →  compile to binary
 ./binary                      →  runner.h: wall-clock GFLOP/s + correctness check
 ncu --metrics ... ./binary    →  hardware counters: why fast or slow
 ```
-
-## Common mistakes
-
-| Mistake | Effect |
-|---|---|
-| Missing `-arch=sm_75` | WMMA intrinsics silently compile away; kernel runs empty and reports fake throughput |
-| Skipping `%%writefile runner.h` | Compile error — `#include "/content/runner.h"` not found |
-| `/proc/driver/nvidia/...` path not found | Newer Colab driver — skip Step 6 and add `--target-processes all --clock-control none` to ncu instead |
-| `ERR_NVGPUCTRPERM` after bypass flags | Fall back to `nvprof` which needs no permission |
-| Using ncu execution time for perf comparison | Wrong — instrumentation overhead makes it 10–100x slower than real runtime |
-| Using `runner.h` for kernels 07–10 | Type mismatch — kernels 07–10 take `__half*` inputs; use `runner_half.h` instead |
