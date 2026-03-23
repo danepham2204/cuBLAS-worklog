@@ -91,7 +91,7 @@ The diagrams below serve as architectural reference throughout the optimization 
 
 ![NVIDIA Hopper Reference](img/GPU-NVIDIA-H100-SXM5-with-note.png)
 
-*(Note: While these reference diagrams depict newer architectures like H100, this project's quantitative benchmarks were established on the Turing SM75 architecture.)*
+_(Note: While these reference diagrams depict newer architectures like H100, this project's quantitative benchmarks were established on the Turing SM75 architecture.)_
 
 Key notes:
 
@@ -141,17 +141,17 @@ Early kernels operate at the block and thread level. Later kernels introduce war
 
 ## 7. Optimization Roadmap
 
-| Version | File                                       | Core Optimization              | Main Bottleneck Targeted                         |
-| :------ | :----------------------------------------- | :----------------------------- | :----------------------------------------------- |
-| **01**  | `01. Build Naive SGEMM.cu`                 | Baseline CUDA SGEMM            | Establish correctness and baseline mapping       |
-| **02**  | `02. Shared Memory Tiling.cu`              | Shared-memory tiling           | Repeated global-memory accesses                  |
-| **03**  | `03. Register Tiling - 1 side.cu`          | 1D register tiling             | Low arithmetic intensity                         |
-| **04**  | `04. Register Tiling - 2 side.cu`          | 2D register tiling             | Excessive shared-memory traffic per output       |
-| **05**  | `05. Vectorized Register Tiling.cu`        | Vectorized loads/stores        | Load/store instruction pressure                  |
-| **06**  | `06. Warp Tiling.cu`                       | Warp tiling                    | Scheduler alignment, locality, register pressure |
-| **07**  | `07. Tensor Cores Baseline (WMMA).cu`      | WMMA Tensor Core baseline      | Transition from scalar FMA to Tensor Cores       |
-| **08**  | `08. Tensor Cores - Shared Memory WMMA.cu` | Shared-memory staged WMMA      | Tensor Core operand reuse and feed efficiency    |
-| **09**  | `09. Async Producer–Consumer Pipeline.cu`  | Software pipelining & epilogue | Pipeline bubbles and load/compute serialization  |
+| Version | File                                       | Core Optimization                           | Main Bottleneck Targeted                            |
+| :------ | :----------------------------------------- | :------------------------------------------ | :-------------------------------------------------- |
+| **01**  | `01. Build Naive SGEMM.cu`                 | Baseline CUDA SGEMM                         | Establish correctness and baseline mapping          |
+| **02**  | `02. Shared Memory Tiling.cu`              | Shared-memory tiling                        | Repeated global-memory accesses                     |
+| **03**  | `03. Register Tiling - 1 side.cu`          | 1D register tiling                          | Low arithmetic intensity                            |
+| **04**  | `04. Register Tiling - 2 side.cu`          | 2D register tiling                          | Excessive shared-memory traffic per output          |
+| **05**  | `05. Vectorized Register Tiling.cu`        | Vectorized loads/stores                     | Load/store instruction pressure                     |
+| **06**  | `06. Warp Tiling.cu`                       | Warp tiling                                 | Scheduler alignment, locality, register pressure    |
+| **07**  | `07. Tensor Cores Baseline (WMMA).cu`      | WMMA Tensor Core baseline                   | Transition from scalar FMA to Tensor Cores          |
+| **08**  | `08. Tensor Cores - Shared Memory WMMA.cu` | Shared-memory staged WMMA                   | Tensor Core operand reuse and feed efficiency       |
+| **09**  | `09. Async Producer–Consumer Pipeline.cu`  | Software pipelining & epilogue              | Pipeline bubbles and load/compute serialization     |
 | **10**  | `10. Vectorized Tensor Core Pipeline.cu`   | Vectorized `int4` loads + `float4` epilogue | Memory instruction pressure in Tensor Core pipeline |
 
 ---
@@ -478,12 +478,50 @@ The warp is the actual unit of execution in NVIDIA hardware. Tensor Cores requir
 - L1 data cache and shared memory
 - FP32 CUDA cores
 
+**Profiling results (ncu, M=N=K=2048)**
+
+| Metric                          | Value      | Interpretation                                  |
+| ------------------------------- | ---------- | ----------------------------------------------- |
+| `sm__warps_active`              | 49.5%      | Only half the warps running — scheduler starved |
+| `dram__bytes_read`              | 485 MB     | ~1.75× more DRAM traffic than cuBLAS (276 MB)   |
+| `l1tex__t_bytes...global_op_ld` | 1.11 GB    | Total L1 global load demand                     |
+| `sm__sass...ffma_pred_on`       | 8.59B inst | Matches theoretical — compute is correct        |
+
+**Arithmetic intensity from hardware counters**
+
+```
+FLOPs = 8.59B × 2 = 17.18 GFLOP
+DRAM  = 0.485 GB
+
+Arithmetic Intensity = 17.18 / 0.485 = 35.4 FLOP/byte
+T4 ridge point       = 8100 GFLOP/s  / 320 GB/s = 25.3 FLOP/byte
+
+AI > ridge point → kernel sits in compute-bound region on roofline.
+But actual throughput = 1568 GFLOP/s = 19.4% of FP32 peak.
+```
+
+The roofline says compute-bound, but utilization is only 19.4%. The gap is explained entirely by the 49.5% warp stall rate — the SM has enough arithmetic intensity in theory but the scheduler cannot issue instructions fast enough because half the warps are stalled waiting for shared memory refills.
+
+**Why v06 is slower than v05 despite better warp alignment**
+
+`BK = 8` is the root cause. With K = 2048, the outer loop runs `2048 / 8 = 256` iterations. Each iteration loads a full A tile (`BM × BK = 64 × 8 = 512` floats) and B tile (`BK × BN = 8 × 64 = 512` floats) into shared memory before any compute happens. The data reuse per byte loaded is far lower than v05, which operates on larger register tiles and performs more FMAs per shared memory access.
+
+```
+Data reuse comparison:
+  v05 (BM=BN=128, TM=TN=8):  each shared memory element reused 8× per thread
+  v06 (BM=BN=64,  BK=8):     each shared memory element reused 4× per thread
+                               + 2× more DRAM refill iterations
+→ v06 generates 2× more DRAM traffic for the same number of FLOPs
+```
+
+Warp alignment reduces instruction-level conflicts, but it cannot overcome a tile configuration that forces the memory subsystem to work twice as hard.
+
 ---
 
 **The problem comes**:
 
-- How can we speed up the matrix multiplication. Currently, 1 warpusing 1 FMA = 1 multiply + 1add = 2FLOP \* 32 = 64 FLOP/instruction
-  whcih is not fast as we think. How about using FP16 with WMMA
+- How can we speed up the matrix multiplication. Currently, 1 warp using 1 FMA = 1 multiply + 1 add = 2 FLOP × 32 = 64 FLOP/instruction,
+  which is not fast enough. How about using FP16 with WMMA?
 
 ### Version 07: Tensor Core WMMA Baseline
 
@@ -547,6 +585,30 @@ Global memory bandwidth: ~320 GB/s    → ~200× too slow
 
 - 2nd-Gen Tensor Cores (Turing SM75)
 - Global memory (GDDR6) for fragment loads — the bottleneck
+
+**Profiling results (ncu, M=N=K=2048)**
+
+| Metric                          | Value      | Interpretation                                  |
+| ------------------------------- | ---------- | ----------------------------------------------- |
+| `sm__warps_active`              | 95.9%      | Warps are highly active, but stalling on memory |
+| `dram__bytes_read`              | 1.28 GB    | Massive memory traffic, ~4.6× the cuBLAS baseline |
+| `l1tex__t_bytes...global_op_ld` | 4.29 GB    | Excessive L1 global load demand                 |
+| `sm__sass...ffma_pred_on`       | 0 inst     | Expected: 0 because Tensor Cores (`hmma`) are used |
+
+**Arithmetic intensity from hardware counters**
+
+```
+FLOPs = 17.18 GFLOP (FP16/FP32 mixed-precision)
+DRAM  = 1.28 GB
+
+Arithmetic Intensity = 17.18 / 1.28 = 13.4 FLOP/byte
+T4 FP16 TC ridge point = 65000 GFLOP/s / 320 GB/s = 203.1 FLOP/byte
+
+AI << ridge point → kernel is severely memory-bound.
+Actual throughput = 1870 GFLOP/s = 2.8% of FP16 Tensor Core peak.
+```
+
+The arithmetic intensity is extremely low (`13.4 FLOP/byte`). The reason is that every warp fetches its own `16×16` fragments directly from global memory. Warps that compute adjacent output tiles re-read the exact same data from HBM because there is no shared memory caching or block-level data reuse. This causes `1.28 GB` of DRAM traffic (4.6× more than cuBLAS). Tensor Cores are starvation-bound by the memory bus.
 
 ---
 
@@ -786,20 +848,20 @@ A `128×128` tile with `int4` loads fully occupies all 256 threads during every 
 
 ## 9. Performance Results
 
-Benchmark: matrix dimensions `2048 × 2048 × 2048`.
+Benchmark: matrix dimensions `2048 × 2048 × 2048`. ncu metrics collected with `--launch-skip 1 --launch-count 1` on a single steady-state invocation.
 
-| Kernel                             | Time (ms) | Performance (GFLOP/s) | Max Absolute Error | Status  |
-| :--------------------------------- | :-------- | :-------------------- | :----------------- | :------ |
-| **01. Naive SGEMM**                | 36.896    | 465.63                | 1.83e-04           | ✅ Pass |
-| **02. Shared Memory Tiling**       | 20.195    | 850.68                | 1.83e-04           | ✅ Pass |
-| **03. Register Tiling (1D)**       | 16.164    | 1062.82               | 1.83e-04           | ✅ Pass |
-| **04. Register Tiling (2D)**       | 12.473    | 1377.36               | 1.83e-04           | ✅ Pass |
-| **05. Vectorized Register Tiling** | 5.199     | 3304.42               | 1.83e-04           | ✅ Pass |
-| **06. Warp Tiling**                | 13.326    | 1289.19               | 1.83e-04           | ✅ Pass |
-| **07. Tensor Cores (WMMA)**        | 7.780     | 2208.25               | 0.00e+00           | ✅ Pass |
-| **08. Tensor Cores SMEM WMMA**     | 7.052     | 2436.32               | 0.00e+00           | ✅ Pass |
-| **09. Async Pipeline WMMA**        | 6.340     | 2709.72               | 0.00e+00           | ✅ Pass |
-| **10. Vectorized TC Pipeline**     | 7.100     | 2466.00               | 0.00e+00           | ✅ Pass |
+| Kernel                             | Time (ms) | GFLOP/s | Warp Active | DRAM Read | Arith. Intensity | Max Error | Status  |
+| :--------------------------------- | :-------- | :------ | :---------- | :-------- | :--------------- | :-------- | :------ |
+| **01. Naive SGEMM**                | 36.896    | 465.63  | —           | —         | —                | 1.83e-04  | ✅ Pass |
+| **02. Shared Memory Tiling**       | 20.195    | 850.68  | —           | —         | —                | 1.83e-04  | ✅ Pass |
+| **03. Register Tiling (1D)**       | 16.164    | 1062.82 | —           | —         | —                | 1.83e-04  | ✅ Pass |
+| **04. Register Tiling (2D)**       | 12.473    | 1377.36 | —           | —         | —                | 1.83e-04  | ✅ Pass |
+| **05. Vectorized Register Tiling** | 5.199     | 3304.42 | —           | —         | —                | 1.83e-04  | ✅ Pass |
+| **06. Warp Tiling**                | 13.326    | 1289.19 | 49.4%       | 543 MB    | 31.6 FLOP/byte   | 1.83e-04  | ✅ Pass |
+| **07. Tensor Cores (WMMA)**        | 7.780     | 2208.25 | —           | —         | —                | 0.00e+00  | ✅ Pass |
+| **08. Tensor Cores SMEM WMMA**     | 7.052     | 2436.32 | —           | —         | —                | 0.00e+00  | ✅ Pass |
+| **09. Async Pipeline WMMA**        | 6.340     | 2709.72 | —           | —         | —                | 0.00e+00  | ✅ Pass |
+| **10. Vectorized TC Pipeline**     | 7.100     | 2466.00 | —           | —         | —                | 0.00e+00  | ✅ Pass |
 
 ---
 
@@ -861,7 +923,32 @@ All kernels are evaluated under the same protocol:
 
 ## 12. Conclusion
 
-High-performance GEMM is not the result of one algorithmic trick. It emerges from a sequence of hardware-aligned structural changes, each one removing the constraint that was limiting the previous version. By tracing the full path from naive global-memory access to asynchronous Tensor Core pipelines, this repository makes the trade-offs of modern GPU programming concrete and observable.
+High-performance GEMM is not the result of one algorithmic trick. It emerges from a sequence of hardware-aligned structural changes, each one removing the constraint that was limiting the previous version.
+
+**What the data shows**
+
+The progression from v01 to v09 is not monotonically smooth. Two results stand out:
+
+1. **v06 (Warp Tiling) is slower than v05 (Vectorized Register Tiling)** despite introducing warp-level output ownership — a concept that becomes essential for Tensor Cores. The ncu data explains why: `BK = 8` forces 256 shared memory reload iterations per kernel call, generating 543 MB of DRAM traffic versus 276 MB for cuBLAS. Warp alignment reduces instruction-level conflicts but cannot compensate for a tile configuration that doubles memory traffic. The lesson: structural correctness and performance are independent — a kernel can have the right abstraction at the wrong scale.
+
+2. **v10 (Vectorized TC Pipeline) is slower than v09** despite issuing 8× fewer memory instructions. The ncu explanation: `BLOCK_TILE_M = 32, BLOCK_TILE_N = 64` produces only 64 `int4` loads for the A tile across 256 threads — 75% of threads sit idle during every load phase. Vectorization and tile size are not separable optimizations. Reducing instruction count while simultaneously reducing in-flight memory requests makes the memory wall worse, not better.
+
+**The pattern across all versions**
+
+Each optimization removes one bottleneck and exposes the next:
+
+```
+v01 → v02: repeated global memory reads        → replaced by shared memory tiling
+v02 → v04: low arithmetic intensity             → replaced by register tiling
+v04 → v05: high load instruction pressure       → replaced by float4 vectorization
+v05 → v07: FP32 CUDA cores near peak            → replaced by FP16 Tensor Cores
+v07 → v09: memory latency serialized with MMA   → replaced by double-buffer pipeline
+v09 → v11: memory instruction count too high    → target: vectorized int4 + larger tiles
+```
+
+The final gap — Tensor Core kernels (v07–v09) peaking at 2.7 TFLOP/s against a 65 TFLOP/s FP16 hardware peak — is the memory wall in its clearest form. The Tensor Core finishes a `16×16×16` MMA in 1–2 cycles and then idles for hundreds of cycles waiting for the next tile. Closing this gap requires either larger tiles (more data reuse per byte fetched) or hardware-async memory (TMA, `cp.async`) that decouples the load pipeline from the compute pipeline entirely. Both are the subject of v11–v13.
+
+By tracing this full path from naive global-memory access to asynchronous Tensor Core pipelines — and verifying each claim with hardware counter data — this repository makes the trade-offs of modern GPU programming concrete, measurable, and reproducible.
 
 ---
 

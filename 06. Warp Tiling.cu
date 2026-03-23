@@ -9,17 +9,6 @@
 // mỗi thread tính 8 x 2 = 16 output
 // block vẫn là 256 threads, nhưng tổ chức thành 8 warps rất rõ ràng
 
-// So với version 5, version 6 đang tối ưu chủ yếu các điểm sau:
-// giảm register pressure rất mạnh
-// tổ chức compute theo đúng đơn vị warp của GPU
-// cải thiện khả năng tăng occupancy
-// làm dataflow trong shared memory rõ theo warp
-// tạo nền tảng để thêm các tối ưu cao cấp hơn
-// Nhưng đánh đổi là:
-// mỗi thread làm ít việc hơn
-// block tile nhỏ hơn
-// bản hiện tại chưa còn lợi thế float4 của version 5
-
 // Result:
 // Kernel 6: Warp Tiling
 // Block tile: 64x64x8
@@ -46,7 +35,6 @@
 constexpr int BM = 64;
 constexpr int BN = 64;
 constexpr int BK = 8;
-
 constexpr int WM = 32;
 constexpr int WN = 16;
 
