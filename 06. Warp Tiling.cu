@@ -35,6 +35,7 @@
 constexpr int BM = 64;
 constexpr int BN = 64;
 constexpr int BK = 8;
+
 constexpr int WM = 32;
 constexpr int WN = 16;
 
