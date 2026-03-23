@@ -20,6 +20,24 @@ Each kernel version isolates one structural change, explains the bottleneck it t
 6. [Execution Hierarchy](#6-execution-hierarchy)
 7. [Optimization Roadmap](#7-optimization-roadmap)
 8. [Stage-by-Stage Breakdown](#8-stage-by-stage-breakdown)
+    - [Version 01: Naive SGEMM](#version-01-naive-sgemm)
+    - [Version 02: Shared-Memory Tiling](#version-02-shared-memory-tiling)
+    - [Version 03: Thread-level Strip Tiling (1D tilling)](#version-03-thread-level-strip-tiling-1d-tilling)
+    - [Version 04: Register Tiling (2D)](#version-04-register-tiling-2d)
+    - [Version 05: Vectorized Register Tiling](#version-05-vectorized-register-tiling)
+        - [Why this helps — the coalescing rule](#why-this-helps--the-coalescing-rule)
+    - [Version 06: Warp Tiling](#version-06-warp-tiling)
+        - [Why warp alignment matters](#why-warp-alignment-matters)
+        - [Why v06 is slower than v05 despite better warp alignment](#why-v06-is-slower-than-v05-despite-better-warp-alignment)
+        - [The problem comes](#the-problem-comes)
+    - [Version 07: Tensor Core WMMA Baseline](#version-07-tensor-core-wmma-baseline)
+        - [Why the kernel is still slow (version 07)](#why-the-kernel-is-still-slow-version-07)
+        - [The problem comes](#the-problem-comes-1)
+    - [Version 08: Shared-Memory Staged WMMA](#version-08-shared-memory-staged-wmma)
+    - [Version 09: Producer-Consumer Pipeline and Epilogue Staging](#version-09-producer-consumer-pipeline-and-epilogue-staging)
+    - [Version 10: Vectorized Tensor Core Pipeline](#version-10-vectorized-tensor-core-pipeline)
+        - [Why this approach is correct in principle](#why-this-approach-is-correct-in-principle)
+        - [Why the measured result is lower than version 09 (tile size constraint)](#why-the-measured-result-is-lower-than-version-09-tile-size-constraint)
 9. [Performance Results](#9-performance-results)
 10. [Development Backlog](#10-development-backlog)
     - [10.1 Compilation and the NVCC Story](#101-compilation-and-the-nvcc-story)
@@ -409,7 +427,7 @@ As[ty][tx*4+2] = tmp.z;  As[ty][tx*4+3] = tmp.w;
 // 1 instruction fetches all 4 values
 ```
 
-**Why this helps — the coalescing rule**
+#### Why this helps — the coalescing rule
 
 Global memory transactions happen in 128-byte cache lines. When 32 threads in a warp each load a `float4` from consecutive addresses, all 32×16 = 512 bytes are served in 4 coalesced transactions. With scalar loads, the same data required 16 separate transactions.
 
@@ -458,7 +476,7 @@ Thread owns:
     cols  [warp_col*WARP_N + lane_col*TN  ..  +TN-1]
 ```
 
-**Why warp alignment matters**
+#### Why warp alignment matters
 
 The GPU executes 32 threads together as a warp at all times. If threads in the same warp load from scattered addresses, the memory subsystem must serialize the accesses. Warp-aligned tiling ensures threads in a warp load from contiguous memory regions, maximizing coalescing and minimizing L1/L2 cache conflicts.
 
@@ -502,7 +520,7 @@ But actual throughput = 1568 GFLOP/s = 19.4% of FP32 peak.
 
 The roofline says compute-bound, but utilization is only 19.4%. The gap is explained entirely by the 49.5% warp stall rate — the SM has enough arithmetic intensity in theory but the scheduler cannot issue instructions fast enough because half the warps are stalled waiting for shared memory refills.
 
-**Why v06 is slower than v05 despite better warp alignment**
+#### Why v06 is slower than v05 despite better warp alignment
 
 `BK = 8` is the root cause. With K = 2048, the outer loop runs `2048 / 8 = 256` iterations. Each iteration loads a full A tile (`BM × BK = 64 × 8 = 512` floats) and B tile (`BK × BN = 8 × 64 = 512` floats) into shared memory before any compute happens. The data reuse per byte loaded is far lower than v05, which operates on larger register tiles and performs more FMAs per shared memory access.
 
@@ -518,7 +536,7 @@ Warp alignment reduces instruction-level conflicts, but it cannot overcome a til
 
 ---
 
-**The problem comes**:
+#### The problem comes
 
 - How can we speed up the matrix multiplication. Currently, 1 warp using 1 FMA = 1 multiply + 1 add = 2 FLOP × 32 = 64 FLOP/instruction,
   which is not fast enough. How about using FP16 with WMMA?
@@ -572,7 +590,7 @@ One mma_sync on a 16×16×16 tile:
 
 In comparison, a scalar FMA on 32 FP32 CUDA cores issues 32 × 2 = 64 FLOPs per instruction. Tensor Cores produce 128× more arithmetic per issued instruction.
 
-**Why the kernel is still slow (version 07)**
+#### Why the kernel is still slow (version 07)
 
 Fragments are loaded directly from global memory. The global memory bus (`320 GB/s` on T4) cannot feed the Tensor Cores fast enough.
 
@@ -612,7 +630,7 @@ The arithmetic intensity is extremely low (`13.4 FLOP/byte`). The reason is that
 
 ---
 
-**The problem comes**:
+#### The problem comes
 As we see in v07: HBM → Tensor Cores. But as we know, the HBM cost so much space that make the warp need to wait until all tile loaded. How about loaded into SM first like we do in v2 ?
 
 ### Version 08: Shared-Memory Staged WMMA
@@ -804,11 +822,11 @@ for (int idx = tid; idx < SC_VEC_COUNT; idx += THREADS_PER_BLOCK) {
 }
 ```
 
-**Why this approach is correct in principle**
+#### Why this approach is correct in principle
 
 Vectorized loads are the standard technique for saturating a memory bus with high bandwidth and limited warp counts. Version 05 (pure FP32) achieved `3304 GFLOP/s` — faster than any Tensor Core kernel — precisely because `float4` loads issued 8× fewer memory transactions and kept the bus busy. The same logic applies here: fewer, wider loads reduce the occupancy of the LD/ST pipeline and leave more scheduler slots open for compute instructions.
 
-**Why the measured result is lower than version 09 (tile size constraint)**
+#### Why the measured result is lower than version 09 (tile size constraint)
 
 With `BLOCK_TILE_M = 32` and `BLOCK_TILE_N = 64`, the A-tile requires only **64 `int4` loads** total. With 256 threads issuing loads in parallel, each thread gets at most one load assignment per loop iteration — **75% of threads are idle** during the A-load phase. The B-tile (128 `int4` loads) is slightly better but still leaves half the threads idle.
 
