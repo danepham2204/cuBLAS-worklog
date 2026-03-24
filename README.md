@@ -14,30 +14,31 @@ Each kernel version isolates one structural change, explains the bottleneck it t
 
 1. [Problem Statement](#1-problem-statement)
 2. [Research Objective](#2-research-objective)
+   - [The Two-Phase Goal](#the-two-phase-goal)
 3. [Why GEMM Matters](#3-why-gemm-matters)
 4. [Hardware Context](#4-hardware-context)
 5. [Conceptual Dataflow](#5-conceptual-dataflow)
 6. [Execution Hierarchy](#6-execution-hierarchy)
 7. [Optimization Roadmap](#7-optimization-roadmap)
 8. [Stage-by-Stage Breakdown](#8-stage-by-stage-breakdown)
-    - [Version 01: Naive SGEMM](#version-01-naive-sgemm)
-    - [Version 02: Shared-Memory Tiling](#version-02-shared-memory-tiling)
-    - [Version 03: Thread-level Strip Tiling (1D tilling)](#version-03-thread-level-strip-tiling-1d-tilling)
-    - [Version 04: Register Tiling (2D)](#version-04-register-tiling-2d)
-    - [Version 05: Vectorized Register Tiling](#version-05-vectorized-register-tiling)
-        - [Why this helps — the coalescing rule](#why-this-helps--the-coalescing-rule)
-    - [Version 06: Warp Tiling](#version-06-warp-tiling)
-        - [Why warp alignment matters](#why-warp-alignment-matters)
-        - [Why v06 is slower than v05 despite better warp alignment](#why-v06-is-slower-than-v05-despite-better-warp-alignment)
-        - [The problem comes](#the-problem-comes)
-    - [Version 07: Tensor Core WMMA Baseline](#version-07-tensor-core-wmma-baseline)
-        - [Why the kernel is still slow (version 07)](#why-the-kernel-is-still-slow-version-07)
-        - [The problem comes](#the-problem-comes-1)
-    - [Version 08: Shared-Memory Staged WMMA](#version-08-shared-memory-staged-wmma)
-    - [Version 09: Producer-Consumer Pipeline and Epilogue Staging](#version-09-producer-consumer-pipeline-and-epilogue-staging)
-    - [Version 10: Vectorized Tensor Core Pipeline](#version-10-vectorized-tensor-core-pipeline)
-        - [Why this approach is correct in principle](#why-this-approach-is-correct-in-principle)
-        - [Why the measured result is lower than version 09 (tile size constraint)](#why-the-measured-result-is-lower-than-version-09-tile-size-constraint)
+   - [Version 01: Naive SGEMM](#version-01-naive-sgemm)
+   - [Version 02: Shared-Memory Tiling](#version-02-shared-memory-tiling)
+   - [Version 03: Thread-level Strip Tiling (1D tilling)](#version-03-thread-level-strip-tiling-1d-tilling)
+   - [Version 04: Register Tiling (2D)](#version-04-register-tiling-2d)
+   - [Version 05: Vectorized Register Tiling](#version-05-vectorized-register-tiling)
+     - [Why this helps — the coalescing rule](#why-this-helps--the-coalescing-rule)
+   - [Version 06: Warp Tiling](#version-06-warp-tiling)
+     - [Why warp alignment matters](#why-warp-alignment-matters)
+     - [Why v06 is slower than v05 despite better warp alignment](#why-v06-is-slower-than-v05-despite-better-warp-alignment)
+     - [The problem comes](#the-problem-comes)
+   - [Version 07: Tensor Core WMMA Baseline](#version-07-tensor-core-wmma-baseline)
+     - [Why the kernel is still slow (version 07)](#why-the-kernel-is-still-slow-version-07)
+     - [The problem comes](#the-problem-comes-1)
+   - [Version 08: Shared-Memory Staged WMMA](#version-08-shared-memory-staged-wmma)
+   - [Version 09: Producer-Consumer Pipeline and Epilogue Staging](#version-09-producer-consumer-pipeline-and-epilogue-staging)
+   - [Version 10: Vectorized Tensor Core Pipeline](#version-10-vectorized-tensor-core-pipeline)
+     - [Why this approach is correct in principle](#why-this-approach-is-correct-in-principle)
+     - [Why the measured result is lower than version 09 (tile size constraint)](#why-the-measured-result-is-lower-than-version-09-tile-size-constraint)
 9. [Performance Results](#9-performance-results)
 10. [Development Backlog](#10-development-backlog)
     - [10.1 Compilation and the NVCC Story](#101-compilation-and-the-nvcc-story)
@@ -87,6 +88,47 @@ The project aims to:
 3. Explain the resulting dataflow and execution model.
 4. Analyze the trade-offs each architectural change introduces.
 5. Build a logical progression from scalar CUDA core execution to asynchronous Tensor Core pipelines.
+
+### The Two-Phase Goal
+
+The optimization path splits into two structurally distinct phases, each with a concrete measurable target.
+
+**Phase 1 — Reach the memory-bound limit**
+
+The T4's memory bandwidth is 320 GB/s. A kernel whose arithmetic intensity exceeds the FP16 Tensor Core ridge point (203 FLOP/byte) is fully compute-bound; below it, performance is capped by bandwidth alone.
+
+```
+Memory-bound limit at current AI:
+  v10 AI = 37.0 FLOP/byte → bandwidth ceiling = 320 × 37.0 = 11,840 GFLOP/s
+  v10 actual              =                                   2,984 GFLOP/s
+  Efficiency vs bandwidth ceiling: 25%
+
+Target for v11 (128×128 tiles + int4 loads):
+  All 256 threads busy in every load phase → saturate 320 GB/s
+  Expected: ~10,000–12,000 GFLOP/s
+```
+
+Reaching the memory-bound limit proves that the kernel has eliminated all scheduling inefficiencies (idle threads, low MLP, uncoalesced access) and that **bandwidth is the only remaining constraint** — not poor software structure.
+
+**Phase 2 — Reach the compute-bound limit (hardware constraint)**
+
+Once memory is saturated, the only path forward is to increase arithmetic intensity beyond the ridge point, which requires either larger tiles or hardware-async memory decoupled from compute. On T4 (SM75):
+
+```
+T4 does NOT support cp.async (SM80+) or TMA (SM90+).
+→ True compute-bound operation is architecturally unreachable on T4.
+
+cuBLAS FP16 on T4:  ~40,000 GFLOP/s = 62% of 65 TFLOP/s peak
+Our best (v08):      3,230 GFLOP/s =  5% of peak
+
+The 13× gap between our best and cuBLAS is:
+  50% software (tile size, vectorization, scheduling)  ← addressable on T4
+  50% hardware (cp.async, persistent kernels, L2 prefetch) ← requires SM80+
+```
+
+**The concrete thesis this project tests:**
+
+> _Reaching the memory-bound limit on T4 with FP16 GEMM requires simultaneously satisfying three conditions: (1) tiles large enough to keep all threads busy during vectorized loads, (2) 128-bit load instructions to saturate the LD/ST pipeline, and (3) a double-buffered pipeline to overlap load and compute within the software constraint of SM75. Kernels v11 is the first to satisfy all three._
 
 ---
 
@@ -606,12 +648,12 @@ Global memory bandwidth: ~320 GB/s    → ~200× too slow
 
 **Profiling results (ncu, M=N=K=2048)**
 
-| Metric                          | Value      | Interpretation                                  |
-| ------------------------------- | ---------- | ----------------------------------------------- |
-| `sm__warps_active`              | 95.9%      | Warps are highly active, but stalling on memory |
-| `dram__bytes_read`              | 1.28 GB    | Massive memory traffic, ~4.6× the cuBLAS baseline |
-| `l1tex__t_bytes...global_op_ld` | 4.29 GB    | Excessive L1 global load demand                 |
-| `sm__sass...ffma_pred_on`       | 0 inst     | Expected: 0 because Tensor Cores (`hmma`) are used |
+| Metric                          | Value   | Interpretation                                     |
+| ------------------------------- | ------- | -------------------------------------------------- |
+| `sm__warps_active`              | 95.9%   | Warps are highly active, but stalling on memory    |
+| `dram__bytes_read`              | 1.28 GB | Massive memory traffic, ~4.6× the cuBLAS baseline  |
+| `l1tex__t_bytes...global_op_ld` | 4.29 GB | Excessive L1 global load demand                    |
+| `sm__sass...ffma_pred_on`       | 0 inst  | Expected: 0 because Tensor Cores (`hmma`) are used |
 
 **Arithmetic intensity from hardware counters**
 
@@ -631,6 +673,7 @@ The arithmetic intensity is extremely low (`13.4 FLOP/byte`). The reason is that
 ---
 
 #### The problem comes
+
 As we see in v07: HBM → Tensor Cores. But as we know, the HBM cost so much space that make the warp need to wait until all tile loaded. How about loaded into SM first like we do in v2 ?
 
 ### Version 08: Shared-Memory Staged WMMA
@@ -686,12 +729,12 @@ v08: global loads unchanged but data is reused BN/16 times from SMEM instead of 
 
 **Profiling results (ncu, M=N=K=2048)**
 
-| Metric                          | Value      | Interpretation                                  |
-| ------------------------------- | ---------- | ----------------------------------------------- |
-| `sm__warps_active`              | 98.5%      | Extremely high warp occupancy, latency is partially hidden |
-| `dram__bytes_read`              | 662 MB     | ~1.9× reduction in DRAM traffic vs V07 (1.28 GB) |
-| `l1tex__t_bytes...global_op_ld` | 801 MB     | Massive reduction in L1 load demand vs V07 (4.29 GB) |
-| `sm__sass...ffma_pred_on`       | 0 inst     | Expected: 0 because Tensor Cores (`hmma`) are used |
+| Metric                          | Value  | Interpretation                                             |
+| ------------------------------- | ------ | ---------------------------------------------------------- |
+| `sm__warps_active`              | 98.5%  | Extremely high warp occupancy, latency is partially hidden |
+| `dram__bytes_read`              | 662 MB | ~1.9× reduction in DRAM traffic vs V07 (1.28 GB)           |
+| `l1tex__t_bytes...global_op_ld` | 801 MB | Massive reduction in L1 load demand vs V07 (4.29 GB)       |
+| `sm__sass...ffma_pred_on`       | 0 inst | Expected: 0 because Tensor Cores (`hmma`) are used         |
 
 **Arithmetic intensity from hardware counters**
 
@@ -793,12 +836,12 @@ The effectiveness depends on whether the compute time for one tile (`BM × BN ×
 
 **Profiling results (ncu, M=N=K=2048)**
 
-| Metric                          | Value      | Interpretation                                  |
-| ------------------------------- | ---------- | ----------------------------------------------- |
-| `sm__warps_active`              | 98.0%      | Extremely high warp occupancy (similar to V08)  |
+| Metric                          | Value      | Interpretation                                        |
+| ------------------------------- | ---------- | ----------------------------------------------------- |
+| `sm__warps_active`              | 98.0%      | Extremely high warp occupancy (similar to V08)        |
 | `dram__bytes_read`              | 745 MB     | Slight increase due to shared memory epilogue C reads |
-| `l1tex__t_bytes...global_op_ld` | 812 MB     | Similar to V08                                  |
-| `sm__sass...ffma_pred_on`       | 4.19M inst | Exactly 2048×2048: Epilogue scalar FP32 FMAs    |
+| `l1tex__t_bytes...global_op_ld` | 812 MB     | Similar to V08                                        |
+| `sm__sass...ffma_pred_on`       | 4.19M inst | Exactly 2048×2048: Epilogue scalar FP32 FMAs          |
 
 **Arithmetic intensity from hardware counters**
 
@@ -915,12 +958,12 @@ A `128×128` tile with `int4` loads fully occupies all 256 threads during every 
 
 **Profiling results (ncu, M=N=K=2048)**
 
-| Metric                          | Value      | Interpretation                                  |
-| ------------------------------- | ---------- | ----------------------------------------------- |
-| `sm__warps_active`              | 98.3%      | Extremely high warp occupancy                   |
-| `dram__bytes_read`              | 464 MB     | Huge reduction! Nearly approaches cuBLAS (276 MB)|
-| `l1tex__t_bytes...global_op_ld` | 780 MB     | Similar to V08 and V09                          |
-| `sm__sass...ffma_pred_on`       | 0 inst     | Because V10 is an incomplete pipeline demo without epilogue |
+| Metric                          | Value  | Interpretation                                              |
+| ------------------------------- | ------ | ----------------------------------------------------------- |
+| `sm__warps_active`              | 98.3%  | Extremely high warp occupancy                               |
+| `dram__bytes_read`              | 464 MB | Huge reduction! Nearly approaches cuBLAS (276 MB)           |
+| `l1tex__t_bytes...global_op_ld` | 780 MB | Similar to V08 and V09                                      |
+| `sm__sass...ffma_pred_on`       | 0 inst | Because V10 is an incomplete pipeline demo without epilogue |
 
 **Arithmetic intensity from hardware counters**
 
@@ -934,7 +977,7 @@ Actual throughput = 2984 GFLOP/s = 4.6% of FP16 Tensor Core peak.
 
 The vectorized loads (`int4`) dramatically reduce DRAM traffic down to `464 MB` because cache lines are fetched much more efficiently and redundant fetching is minimized. This drives the Arithmetic Intensity up to `37.0 FLOP/byte` (the highest so far).
 
-Despite the excellent memory efficiency, the overall throughput actually *dropped* slightly (from `3105 GFLOP/s` in V09 down to `2984 GFLOP/s`). As explained above, the root cause is the `32×64` tile constraint: moving to 128-bit loads means only 25% of the 256 threads are actively issuing memory requests for the `A` tile. This severe loss of Memory-Level Parallelism (MLP) prevents the GPU from saturating the memory bus. Mending this requires significantly larger Shared Memory tiles.
+Despite the excellent memory efficiency, the overall throughput actually _dropped_ slightly (from `3105 GFLOP/s` in V09 down to `2984 GFLOP/s`). As explained above, the root cause is the `32×64` tile constraint: moving to 128-bit loads means only 25% of the 256 threads are actively issuing memory requests for the `A` tile. This severe loss of Memory-Level Parallelism (MLP) prevents the GPU from saturating the memory bus. Mending this requires significantly larger Shared Memory tiles.
 
 ---
 
