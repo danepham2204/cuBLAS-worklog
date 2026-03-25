@@ -79,7 +79,7 @@ This repository investigates how those inefficiencies can be removed systematica
 
 ## 2. Research Objective
 
-> **How can a CUDA GEMM kernel be systematically re-engineered, layer by layer, to bridge the gap between a naive implementation and the hardware's theoretical peak performance, and what are the fundamental architectural bottlenecks that dictate each transformation?*
+> \*_How can a CUDA GEMM kernel be systematically re-engineered, layer by layer, to bridge the gap between a naive implementation and the hardware's theoretical peak performance, and what are the fundamental architectural bottlenecks that dictate each transformation?_
 
 The project aims to:
 
@@ -226,6 +226,8 @@ Each version is explained with: the core formula, the thread/block mapping, the 
 
 ![CUDA programming model hierarchy](img/model_hierarchy.jpg)
 
+The CUDA programming model organizes threads into a three-level hierarchy: a **grid** of **blocks**, each containing **threads**. Every thread runs the same kernel function but uses its `blockIdx` and `threadIdx` to determine which part of the output it is responsible for. In GEMM, this maps naturally onto the output matrix `C` — the grid covers the full `M×N` output space, each block owns a tile, and each thread owns one element.
+
 **Core formula**
 
 Each element of the output matrix is a dot product over the full reduction dimension `K`:
@@ -233,6 +235,44 @@ Each element of the output matrix is a dot product over the full reduction dimen
 ```
 C[row][col] = sum( A[row][k] * B[k][col] )  for k = 0 .. K-1
 ```
+
+---
+
+This diagram shows the concrete mapping for `M=N=K=2048`.
+
+![Naive SGEMM grid and thread mapping](img/matrix-multiplicaiton.jpg)
+
+**Grid and block configuration**
+
+```
+blockDim = (32, 32)         → 1024 threads per block
+gridDim  = (CEIL(K/32), CEIL(M/32)) = (64, 64)
+→ 64 × 64 = 4,096 blocks launched, each covering a 32×32 tile of C
+```
+
+**Concrete example — block (2, 2), thread (0, 0)**
+
+```
+Row    in A: blockIdx.y * 32 + threadIdx.y = 2 * 32 + 0 = 64
+Column in B: blockIdx.x * 32 + threadIdx.x = 2 * 32 + 0 = 64
+
+This thread computes C[64][64]:
+  = A[64][0]*B[0][64] + A[64][1]*B[1][64] + ... + A[64][2047]*B[2047][64]
+  → 2048 multiply-accumulate operations, all from global memory
+```
+
+**`__restrict__` optimization**
+
+The kernel declares all three pointers with `__restrict__`:
+
+```cpp
+__global__ void sgemm_coalesced(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+          float* __restrict__ C, ...)
+```
+
+This tells the compiler that `A`, `B`, and `C` do not alias each other in memory. Without this hint, the compiler must assume any store to `C` could affect the values read through `A` or `B`, which prevents it from reordering or vectorizing loads. With `__restrict__`, the compiler is free to schedule memory instructions more aggressively and reduce stalls.
 
 **Thread mapping**
 
@@ -260,7 +300,7 @@ Bytes loaded     = 2 * K * 4 bytes  (A row + B column, both float32)
 Arithmetic intensity = (2K) / (8K) = 0.25 FLOP/byte
 ```
 
-For `K=2048` this is still only `0.25 FLOP/byte`. The T4 needs roughly `13 FLOP/byte` to be compute-bound. This kernel is entirely memory-bound.
+For `K=2048` this is still only `0.25 FLOP/byte`. The T4 needs roughly ~10–15 FLOP/byte as the threshold. This kernel is entirely memory-bound.
 
 **Hardware units used**
 
