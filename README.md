@@ -238,9 +238,9 @@ C[row][col] = sum( A[row][k] * B[k][col] )  for k = 0 .. K-1
 
 ---
 
-This diagram shows the concrete mapping for `M=N=K=2048`.
+This below diagram shows the concrete mapping for `M=N=K=2048`:
 
-![Naive SGEMM grid and thread mapping](img/matrix-multiplicaiton.jpg)
+![Naive SGEMM grid and thread mapping](img/matrix-multiplication.png)
 
 **Grid and block configuration**
 
