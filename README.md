@@ -13,6 +13,9 @@ Each kernel version isolates one structural change, explains the bottleneck it t
 ## Table of Contents
 
 1. [Problem Statement](#1-problem-statement)
+   - [1.1 Why Parallel Computing Became Necessary](#11-why-parallel-computing-became-necessary)
+   - [1.2 The Gap Parallelism Creates](#12-the-gap-parallelism-creates)
+   - [1.3 Why GEMM Is the Right Kernel to Study](#13-why-gemm-is-the-right-kernel-to-study)
 2. [Research Objective](#2-research-objective)
    - [The Two-Phase Goal](#the-two-phase-goal)
 3. [Hardware Context](#3-hardware-context)
@@ -50,7 +53,68 @@ Each kernel version isolates one structural change, explains the bottleneck it t
 
 ## 1. Problem Statement
 
-The core computation studied here is GEMM:
+### 1.1 Why Parallel Computing Became Necessary
+
+For five decades, Moore's Law governed computing progress. In 1965, Gordon Moore observed that the number of transistors on an integrated circuit doubled approximately every two years — a trend that held remarkably well from 1965 through the mid-2010s:
+
+```
+1971 (Intel 4004):   2,300 transistors    @ 740 kHz
+1989 (Intel 486):    1,200,000            @ 25 MHz
+2000 (Pentium 4):    42,000,000           @ 1.5 GHz
+2006 (Core 2 Duo):   291,000,000          @ 2.9 GHz
+2023 (Apple M2 Pro): 40,000,000,000       @ 3.7 GHz
+```
+
+Critically, for the first 40 years, transistor density improvements also delivered **free clock speed scaling** — a phenomenon described by Dennard Scaling (1974): as transistors shrank, their power density stayed constant, so the chip could be clocked faster at the same thermal envelope. Software got faster for free with every hardware generation.
+
+**Dennard Scaling broke around 2004–2006.**
+
+As transistors shrank below ~90 nm, leakage current became significant. Smaller transistors no longer ran proportionally cooler — they ran *hotter*. Power density rose faster than cooling solutions could handle. The result:
+
+```
+Single-core clock frequency scaling:
+  1986–2002:  +52% per year  (Dennard regime)
+  2002–2005:  +25% per year  (scaling degrading)
+  2005–today: ~0% per year   (plateau — thermal wall)
+```
+
+The industry's response was not to wait for physics to cooperate — it was to go **wide instead of fast**. If one core cannot be clocked faster, deploy thousands of simpler cores and extract parallelism from the workload.
+
+```
+CPU direction:  2 → 4 → 8 → 64 cores (branch prediction, out-of-order, caches)
+GPU direction:  thousands of simpler cores, optimized for throughput over latency
+
+NVIDIA T4 (2018):  2,560 CUDA cores + 320 Tensor Cores @ 65 TFLOP/s FP16 peak
+```
+
+Moore's Law itself continued — transistor counts kept doubling — but the benefit shifted from faster single-thread execution to wider parallelism. **Software that cannot exploit parallelism stopped getting faster.**
+
+### 1.2 The Gap Parallelism Creates
+
+Massive parallelism is not free throughput — it creates a new class of engineering problem. A GPU with 2,560 cores delivers peak performance only when all cores are kept busy with useful work and memory feeds them fast enough to avoid stalls. Most software does neither.
+
+The roofline model formalizes this as **arithmetic intensity** — the ratio of floating-point operations to bytes transferred:
+
+```
+Arithmetic intensity (I) = FLOPs executed / Bytes loaded from memory
+
+If I < ridge point:  kernel is memory-bound  → bounded by bandwidth, not compute
+If I > ridge point:  kernel is compute-bound → bounded by FP throughput
+```
+
+For the NVIDIA T4:
+
+```
+Memory bandwidth:       320 GB/s
+FP16 Tensor Core peak:  65,000 GFLOP/s
+Ridge point:            65,000 / 320 ≈ 203 FLOP/byte
+```
+
+A naive GEMM kernel operating at `I = 0.25 FLOP/byte` — 800× below the ridge point — leaves 99% of the available compute unused. Every optimization in this project is an attempt to raise `I` closer to the ridge point.
+
+### 1.3 Why GEMM Is the Right Kernel to Study
+
+The core computation studied here is:
 
 ```
 C = alpha * A * B + beta * C
@@ -62,18 +126,20 @@ Following standard conventions:
 - `B ∈ ℝ^(K × N)`
 - `C ∈ ℝ^(M × N)`
 
-A naive GPU implementation of GEMM fails to exploit the memory and execution hierarchies of NVIDIA GPUs. Despite enormous theoretical parallelism, a simple kernel typically suffers from:
+GEMM is not just an academic exercise — it is the dominant operation in deep learning. Fully-connected layers, attention projections, and convolutions all reduce to matrix multiplication. cuBLAS, the library this project rebuilds, exists because GEMM performance directly determines the speed of model training and inference.
 
-- excessive global-memory traffic
-- poor data reuse and low arithmetic intensity
-- high load/store instruction overhead
-- register pressure
-- insufficient overlap between memory and compute
-- under utilization of Tensor Cores
+More importantly, GEMM is the right kernel to study because it exposes **the full interaction between every GPU optimization technique simultaneously**: thread hierarchy and warp scheduling, global and shared memory bandwidth, register reuse and instruction throughput, and specialized hardware such as Tensor Cores. Every bottleneck that exists in GPU programming appears in GEMM, making each transformation directly observable and measurable.
 
-This repository investigates how those inefficiencies can be removed systematically through kernel restructuring.
+A naive GPU implementation fails to exploit these hierarchies. Despite enormous theoretical parallelism, a simple kernel suffers from:
 
-GEMM is the right kernel to study because it exposes the full interaction between thread hierarchy and warp scheduling, global and shared memory bandwidth, register reuse and instruction throughput, and specialized hardware such as Tensor Cores — making every GPU optimization technique directly observable and measurable.
+- excessive global-memory traffic — arithmetic intensity `I = 0.25 FLOP/byte`
+- poor data reuse — neighboring threads re-fetch the same data independently
+- high load/store instruction overhead — one instruction per 4 bytes instead of 16
+- register pressure — too many live values competing for the 256 KB register file
+- insufficient overlap between memory and compute — loads serialize with FMAs
+- under-utilization of Tensor Cores — hardware capable of 65 TFLOP/s sits idle
+
+This repository investigates how those inefficiencies can be removed systematically through kernel restructuring — tracing the same engineering path that produced cuBLAS, one bottleneck at a time.
 
 ---
 
