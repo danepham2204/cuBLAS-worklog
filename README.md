@@ -55,7 +55,7 @@ Each kernel version isolates one structural change, explains the bottleneck it t
 
 ### 1.1 Why Parallel Computing Became Necessary
 
-For five decades, Moore's Law governed computing progress. In 1965, Gordon Moore observed that the number of transistors on an integrated circuit doubled approximately every two years — a trend that held remarkably well from 1965 through the mid-2010s:
+For five decades, Moore's Law governed computing progress. In 1965, Gordon Moore observed that the number of transistors on an integrated circuit doubled approximately every two years — a trend that held remarkably well from 1965 through the mid-2010s, 1 khz = 1000 cycles per second:
 
 ```
 1971 (Intel 4004):   2,300 transistors    @ 740 kHz
@@ -65,11 +65,11 @@ For five decades, Moore's Law governed computing progress. In 1965, Gordon Moore
 2023 (Apple M2 Pro): 40,000,000,000       @ 3.7 GHz
 ```
 
-Critically, for the first 40 years, transistor density improvements also delivered **free clock speed scaling** — a phenomenon described by Dennard Scaling (1974): as transistors shrank, their power density stayed constant, so the chip could be clocked faster at the same thermal envelope. Software got faster for free with every hardware generation.
+And if we overlook back for the first 40 years, transistor density improvements also delivered **free clock speed scaling** — a phenomenon described by Dennard Scaling (1974): as transistors shrank, their power density stayed constant, so the chip could be clocked faster at the same thermal envelope. Software got faster for free with every hardware generation.
 
 **Dennard Scaling broke around 2004–2006.**
 
-As transistors shrank below ~90 nm, leakage current became significant. Smaller transistors no longer ran proportionally cooler — they ran *hotter*. Power density rose faster than cooling solutions could handle. The result:
+As transistors shrank below ~90 nm, leakage current became significant. Smaller transistors no longer ran proportionally cooler — they ran _hotter_. Power density rose faster than cooling solutions could handle. The result:
 
 ```
 Single-core clock frequency scaling:
@@ -314,9 +314,9 @@ For a 2D block `(B, B)` flattened the same way, warp `w` contains the threads wh
 
 **Memory transaction model**
 
-Global memory (HBM/GDDR) is accessed in aligned chunks of **32 B**, **64 B**, or **128 B** — called *cache lines*. When a warp issues a load, the L1 cache controller collects all 32 addresses and merges those that fall in the same 128-byte sector into a single transaction.
+Global memory (HBM/GDDR) is accessed in aligned chunks of **32 B**, **64 B**, or **128 B** — called _cache lines_. When a warp issues a load, the L1 cache controller collects all 32 addresses and merges those that fall in the same 128-byte sector into a single transaction.
 
-Define the *flat address* that thread `i` in a warp reads as `addr(i)`. The number of 128-byte transactions issued is:
+Define the _flat address_ that thread `i` in a warp reads as `addr(i)`. The number of 128-byte transactions issued is:
 
 ```
 transactions = |{ ⌊addr(i) / 128⌋ : i = 0 … 31 }|
@@ -350,7 +350,7 @@ addr_A at step k = base_A + (row · N + k) · 4
 
 This address is **identical** for all 32 threads in the warp (same `row`, same `k`). The hardware broadcasts a single 4-byte load to all 32 threads: **1 transaction regardless of warp width**.
 
-The interesting moment is when 32 threads from the same warp all execute the *same* `k` step simultaneously and their `row` values differ. Consider warp `w` at the first step `k=0`. All 32 threads share `t_y`, so they all share the same `row`. They read the same cell — a broadcast, not a coalesced load. The row dimension never generates a coalescing opportunity here because each thread computes a different `col` independently.
+The interesting moment is when 32 threads from the same warp all execute the _same_ `k` step simultaneously and their `row` values differ. Consider warp `w` at the first step `k=0`. All 32 threads share `t_y`, so they all share the same `row`. They read the same cell — a broadcast, not a coalesced load. The row dimension never generates a coalescing opportunity here because each thread computes a different `col` independently.
 
 **Coalescing analysis for matrix B**
 
