@@ -1,6 +1,6 @@
 # Rebuilding cuBLAS: From a Naive CUDA Kernel to a Tensor Core Pipeline
 
-A correct GEMM kernel is easy to write. A fast one is not. This repository closes the gap between `~465 GFLOP/s` and the `65 TFLOP/s` FP16 Tensor Core peak through a repeated diagnostic loop:
+A correct GEMM kernel is easy to write. A fast one is not. This repository traces the systematic optimization of GEMM on an NVIDIA T4 GPU — closing the gap from a naive `~465 GFLOP/s` up to the hardware's FP32 ceiling of `~3,985 GFLOP/s` (90% of cuBLAS), and eventually moving to Tensor Cores to chase the `65 TFLOP/s` FP16 peak — through a repeated diagnostic loop:
 
 **profile → identify bottleneck → intervene → re-measure**
 
@@ -1251,7 +1251,7 @@ Benchmark: matrix dimensions `2048 × 2048 × 2048`. ncu metrics collected with 
 | **02. Shared Memory Tiling**       | 20.195    | 850.68  | —           | —         | —                | 1.83e-04  | ✅ Pass |
 | **03. Register Tiling (1D)**       | 16.164    | 1062.82 | —           | —         | —                | 1.83e-04  | ✅ Pass |
 | **04. Register Tiling (2D)**       | 12.473    | 1377.36 | —           | —         | —                | 1.83e-04  | ✅ Pass |
-| **05. Vectorized Register Tiling** | 5.199     | 3304.42 | —           | —         | —                | 1.83e-04  | ✅ Pass |
+| **05. Vectorized Register Tiling** | ~4.311    | 3985.00 | ~49.3%      | ~323 MB   | 682.7 FLOP/byte  | 0.00e+00  | ✅ Pass |
 | **06. Warp Tiling**                | 10.957    | 1567.92 | 49.5%       | 485 MB    | 35.4 FLOP/byte   | 1.83e-04  | ✅ Pass |
 | **07. Tensor Cores (WMMA)**        | 9.186     | 1870.31 | 95.9%       | 1.28 GB   | 13.4 FLOP/byte   | 0.00e+00  | ✅ Pass |
 | **08. Tensor Cores SMEM WMMA**     | 5.319     | 3229.80 | 98.5%       | 662 MB    | 25.9 FLOP/byte   | 0.00e+00  | ✅ Pass |
