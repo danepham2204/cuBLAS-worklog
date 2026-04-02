@@ -1,3 +1,5 @@
+%%writefile runner.h
+
 #pragma once
 #include <iostream>
 #include <vector>
@@ -64,7 +66,10 @@ inline void run_benchmark(
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Warmup
-    kernel_launcher(d_A, d_B, d_C, M, N, K);
+    // Warmup: 3 iterations to stabilize JIT, L2 cache, and thermal state
+    for (int i = 0; i < 3; i++) {
+        kernel_launcher(d_A, d_B, d_C, M, N, K);
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Timing
@@ -84,6 +89,19 @@ inline void run_benchmark(
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
     ms /= num_iters;
 
+    // Benchmark cuBLAS for direct comparison
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < num_iters; i++) {
+        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                    &alpha, d_B, N, d_A, K, &beta, d_C_ref, N);
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float cublas_ms;
+    CUDA_CHECK(cudaEventElapsedTime(&cublas_ms, start, stop));
+    cublas_ms /= num_iters;
+
     // Validation
     CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_C_ref.data(), d_C_ref, M * N * sizeof(float), cudaMemcpyDeviceToHost));
@@ -96,11 +114,20 @@ inline void run_benchmark(
 
     double flops = 2.0 * M * N * K;
     double gflops = (flops * 1e-9) / (ms * 1e-3);
+    double cublas_gflops = (flops * 1e-9) / (cublas_ms * 1e-3);
+    double ratio = gflops / cublas_gflops * 100.0;
 
-    std::cout << std::left << std::setw(35) << kernel_name 
-              << " | Size: " << M << "x" << N << "x" << K 
+    // Theoretical AI: min bytes = read A + read B + write C (assuming perfect caching)
+    double bytes_min = (double)(M * K + K * N + M * N) * sizeof(float);
+    double ai = flops / bytes_min;
+
+    std::cout << std::left << std::setw(35) << kernel_name
+              << " | Size: " << M << "x" << N << "x" << K
               << " | Time: " << std::fixed << std::setprecision(3) << std::setw(6) << ms << " ms"
-              << " | Perf: " << std::setprecision(2) << std::setw(8) << gflops << " GFLOP/s"
+              << " | Perf: " << std::setprecision(1) << std::setw(8) << gflops << " GFLOP/s"
+              << " | cuBLAS: " << std::setprecision(1) << std::setw(8) << cublas_gflops << " GFLOP/s"
+              << " | Ratio: " << std::setprecision(1) << std::setw(5) << ratio << "%"
+              << " | AI: " << std::setprecision(1) << ai << " FLOP/byte"
               << " | Max Err: " << std::scientific << std::setprecision(2) << max_err << "\n";
 
     cublasDestroy(handle);
