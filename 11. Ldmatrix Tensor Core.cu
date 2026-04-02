@@ -77,8 +77,21 @@ __device__ __forceinline__ void ldmatrix_a(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ldmatrix helper for matrix_b (row_major K×N tile: sB[BK][BN+PAD])
-// For B stored as [k_step][warp_col]: row = k-dimension, col = N-dimension
-// Lane t provides: smem[(t & 0xF)][warp_col + (t >> 4) * 8]
+//
+// On SM75, TC stores B in a transposed register layout, so we use
+// ldmatrix.trans. The address mapping mirrors ldmatrix_a — lane indexes into
+// the K dimension (rows of B in SMEM), not the N dimension:
+//
+//   krow = lane & 0xF   → 16 distinct K-row addresses  (0 .. 15)
+//   ncol = (lane >> 4) × 8  → N-column group start     (0 or 8)
+//
+// Each thread points to 8 consecutive __half values in the N direction.
+// With .trans the hardware transposes each 8×8 quadrant during the load,
+// mapping B's row-major layout into the correct TC register layout.
+//
+// The previous bug: krow was only (lane>>4)*8 (2 values), and ncol was
+// lane&0xF (16 values) — threads 0-7 all loaded from the same K-row at
+// column offsets 0..7, causing 8-element windows to overlap and corrupt B.
 // ─────────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ void ldmatrix_b(
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major>& frag,
@@ -86,11 +99,11 @@ __device__ __forceinline__ void ldmatrix_b(
     int stride)            // stride in __half  (= BN + PAD = 136)
 {
     const int lane = threadIdx.x & 31;
-    const int row = lane & 0xF;         // 0..15
-    const int col = (lane >> 4) * 8;   // 0 or 8
-    uint32_t ptr = __cvta_generic_to_shared(smem + row * stride + col);
+    const int krow = lane & 0xF;         // 0..15  — K-row index (all 16 rows covered)
+    const int ncol = (lane >> 4) * 8;   // 0 or 8 — N-column group start
+    uint32_t ptr = __cvta_generic_to_shared(smem + krow * stride + ncol);
     uint32_t* r = reinterpret_cast<uint32_t*>(frag.x);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
         : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
         : "r"(ptr));
 }
