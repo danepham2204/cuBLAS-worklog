@@ -2,98 +2,105 @@
 // Kernel 10 - Vectorized Tensor Core Pipeline
 //
 // Progression from version 9:
-// - Version 9: scalar __half loads from global to shared memory, double-buffered pipeline
-// - Version 10: int4 (128-bit) vectorized loads from global to shared, float4 vectorized epilogue
+// - Version 9: scalar __half global→SMEM loads with double buffering
+// - Version 10: int4 (128-bit) vectorized global→SMEM loads + same double-buffer pipeline
 //
 // Why this matters:
-// In Kernels 07-09, Tensor Cores finish their 16x16x16 MMA in 1-2 cycles, then the
-// entire warp stalls waiting for the next tile to arrive from global memory.
-// Scalar __half loads issue 8x. more memory instructions than necessary.
-// By using int4 loads (128 bits = 8 __half per instruction), we drastically reduce
-// the number of memory transactions and better saturate the T4's 320 GB/s bandwidth.
-//
-// Additionally, the epilogue (shared memory -> global C) is vectorized using float4
-// (128 bits = 4 floats per instruction), further reducing store instruction pressure.
-// 
-// Architecture requirement: SM75+ (Turing Tensor Cores)
-// Compile with: nvcc -O3 -arch=sm_75 -lcublas 10_Vectorized_TC.cu -o 10_vtc
+// In Kernel 9, each thread issues many 16-bit loads moving data from Global to SMEM.
+// By using int4 (128-bit = 8 x __half per instruction) we reduce the memory instruction
+// count 8x, dramatically improving MLP (Memory-Level Parallelism) and instruction throughput.
+// With 256 threads and a 128x128x32 tile, each thread issues exactly:
+//   - 2 int4 loads for sA  (128*32 / 8 / 256 = 2)
+//   - 2 int4 loads for sB  (128*32 / 8 / 256 = 2)
+// 100% threads fully utilized doing vectorized memory work!
 
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <cuda_fp16.h>
-
-#include <algorithm>
-#include <cmath>
-#include <iomanip>
 #include <iostream>
-#include <random>
-#include <vector>
+
+using namespace nvcuda;
+
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 32;
 
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
-constexpr int BLOCK_WARPS_M = 2;
-constexpr int BLOCK_WARPS_N = 4;
-constexpr int WARPS_PER_BLOCK = BLOCK_WARPS_M * BLOCK_WARPS_N;  // 8
-constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;         // 256
+constexpr int WM = 32;
+constexpr int WN = 64;
 
-constexpr int BLOCK_TILE_M = BLOCK_WARPS_M * WMMA_M;            // 32
-constexpr int BLOCK_TILE_N = BLOCK_WARPS_N * WMMA_N;            // 64
+constexpr int WARPS_M = BM / WM;             // 4
+constexpr int WARPS_N = BN / WN;             // 2
+constexpr int WARPS_PER_BLOCK = WARPS_M * WARPS_N; // 8
+constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32; // 256
 
-// Number of int4 (128-bit) vector loads needed per shared-memory tile
-// Each int4 carries 8 __half values (8 * 16 bits = 128 bits)
-constexpr int SA_VEC_COUNT = (BLOCK_TILE_M * WMMA_K) / 8;       // 32*16/8 = 64
-constexpr int SB_VEC_COUNT = (WMMA_K * BLOCK_TILE_N) / 8;       // 16*64/8 = 128
+constexpr int FRAGS_M = WM / WMMA_M;         // 2
+constexpr int FRAGS_N = WN / WMMA_N;         // 4
 
-// ─── Vectorized tile loader ───────────────────────────────────────────────────
-// Replaces the scalar loader from Kernel 09.
-// Each thread issues one int4 load (128 bits = 8 __half) instead of eight
-// separate 16-bit loads. This reduces memory instruction count by 8x.
-__device__ void load_stage_tiles_vectorized(
+constexpr int PAD = 8; // Padding in __half units to avoid bank conflicts
+
+// int4 element = 128 bits = 8 x __half
+constexpr int SA_VEC = (BM * BK) / 8;  // 128*32/8 = 512
+constexpr int SB_VEC = (BK * BN) / 8;  // 32*128/8 = 512
+
+__device__ void load_stage_vectorized(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
-    __half sA[2][BLOCK_TILE_M][WMMA_K],
-    __half sB[2][WMMA_K][BLOCK_TILE_N],
+    __half sA[2][BM][BK + PAD],
+    __half sB[2][BK][BN + PAD],
     int M, int N, int K,
     int k0, int tid, int stage)
 {
-    // ── Load A tile: 64 int4 loads (32 rows × 16 cols / 8) ──
-    for (int idx = tid; idx < SA_VEC_COUNT; idx += THREADS_PER_BLOCK) {
-        const int flat = idx * 8;             // flat index in __half space
-        const int row  = flat / WMMA_K;
-        const int col  = flat % WMMA_K;       // always 0 or 8 (since WMMA_K=16)
-        const int g_row = blockIdx.y * BLOCK_TILE_M + row;
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+
+    // --- Vectorized Load A: int4 strides across BM×BK ---
+    for (int idx = tid; idx < SA_VEC; idx += THREADS_PER_BLOCK) {
+        const int flat = idx * 8;
+        const int row  = flat / BK;
+        const int col  = flat % BK;
+        const int g_row = block_row + row;
         const int g_col = k0 + col;
 
         int4 val;
-        if (g_row < M && (g_col + 8) <= K) {
+        if (g_row < M && g_col + 7 < K) {
             val = reinterpret_cast<const int4*>(&A[g_row * K + g_col])[0];
         } else {
-            val = make_int4(0, 0, 0, 0);
+            // Scalar fallback for boundary tiles
+            __half tmp[8] = {};
+            for (int t = 0; t < 8 && g_col + t < K && g_row < M; ++t) {
+                tmp[t] = A[g_row * K + g_col + t];
+            }
+            val = reinterpret_cast<int4*>(tmp)[0];
         }
         reinterpret_cast<int4*>(&sA[stage][row][col])[0] = val;
     }
 
-    // ── Load B tile: 128 int4 loads (16 rows × 64 cols / 8) ──
-    for (int idx = tid; idx < SB_VEC_COUNT; idx += THREADS_PER_BLOCK) {
+    // --- Vectorized Load B: int4 strides across BK×BN ---
+    for (int idx = tid; idx < SB_VEC; idx += THREADS_PER_BLOCK) {
         const int flat = idx * 8;
-        const int row  = flat / BLOCK_TILE_N;
-        const int col  = flat % BLOCK_TILE_N; // always a multiple of 8
+        const int row  = flat / BN;
+        const int col  = flat % BN;
         const int g_row = k0 + row;
-        const int g_col = blockIdx.x * BLOCK_TILE_N + col;
+        const int g_col = block_col + col;
 
         int4 val;
-        if (g_row < K && (g_col + 8) <= N) {
+        if (g_row < K && g_col + 7 < N) {
             val = reinterpret_cast<const int4*>(&B[g_row * N + g_col])[0];
         } else {
-            val = make_int4(0, 0, 0, 0);
+            __half tmp[8] = {};
+            for (int t = 0; t < 8 && g_col + t < N && g_row < K; ++t) {
+                tmp[t] = B[g_row * N + g_col + t];
+            }
+            val = reinterpret_cast<int4*>(tmp)[0];
         }
         reinterpret_cast<int4*>(&sB[stage][row][col])[0] = val;
     }
 }
 
-// ─── Main kernel ──────────────────────────────────────────────────────────────
 __global__ void sgemm_tensor_core_vectorized_pipeline(
     const __half* __restrict__ A,
     const __half* __restrict__ B,
@@ -101,92 +108,99 @@ __global__ void sgemm_tensor_core_vectorized_pipeline(
     int M, int N, int K,
     float alpha, float beta)
 {
-    __shared__ __half sA[2][BLOCK_TILE_M][WMMA_K];
-    __shared__ __half sB[2][WMMA_K][BLOCK_TILE_N];
-    __shared__ float  sC[BLOCK_TILE_M][BLOCK_TILE_N];
+    __shared__ __half sA[2][BM][BK + PAD];
+    __shared__ __half sB[2][BK][BN + PAD];
 
     const int tid     = threadIdx.x;
     const int warp_id = tid / 32;
 
-    const int warp_m = warp_id / BLOCK_WARPS_N;
-    const int warp_n = warp_id % BLOCK_WARPS_N;
+    const int warp_m = warp_id / WARPS_N;
+    const int warp_n = warp_id % WARPS_N;
 
-    const int block_row = blockIdx.y * BLOCK_TILE_M;
-    const int block_col = blockIdx.x * BLOCK_TILE_N;
-    const int c_row     = block_row + warp_m * WMMA_M;
-    const int c_col     = block_col + warp_n * WMMA_N;
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
 
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+    const int warp_row = warp_m * WM;
+    const int warp_col = warp_n * WN;
 
-    // ── Prefetch first tile using vectorized loads ──
-    load_stage_tiles_vectorized(A, B, sA, sB, M, N, K, 0, tid, 0);
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[FRAGS_M][FRAGS_N];
+
+    #pragma unroll
+    for (int i = 0; i < FRAGS_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < FRAGS_N; ++j) {
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+        }
+    }
+
+    // --- Prefetch first tile ---
+    load_stage_vectorized(A, B, sA, sB, M, N, K, 0, tid, 0);
     __syncthreads();
 
-    // ── Double-buffered main loop ──
     int read_stage = 0;
-    for (int k0 = 0; k0 < K; k0 += WMMA_K) {
-        const int next_k      = k0 + WMMA_K;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const int next_k = k0 + BK;
         const int write_stage = read_stage ^ 1;
 
-        // Producer: prefetch next tile while current tile is being consumed
+        // --- PRODUCER: Vectorized load of next tile ---
         if (next_k < K) {
-            load_stage_tiles_vectorized(A, B, sA, sB, M, N, K, next_k, tid, write_stage);
+            load_stage_vectorized(A, B, sA, sB, M, N, K, next_k, tid, write_stage);
         }
 
-        // Consumer: WMMA compute on current tile
-        if (c_row < M && c_col < N) {
-            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> a_frag;
-            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, nvcuda::wmma::row_major> b_frag;
+        // --- CONSUMER: MMA on current tile ---
+        if (block_row + warp_row < M && block_col + warp_col < N) {
+            #pragma unroll
+            for (int k_step = 0; k_step < BK; k_step += WMMA_K) {
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag[FRAGS_M];
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag[FRAGS_N];
 
-            const __half* tile_a = &sA[read_stage][warp_m * WMMA_M][0];
-            const __half* tile_b = &sB[read_stage][0][warp_n * WMMA_N];
-
-            nvcuda::wmma::load_matrix_sync(a_frag, tile_a, WMMA_K);
-            nvcuda::wmma::load_matrix_sync(b_frag, tile_b, BLOCK_TILE_N);
-            nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                #pragma unroll
+                for (int i = 0; i < FRAGS_M; ++i) {
+                    wmma::load_matrix_sync(a_frag[i], &sA[read_stage][warp_row + i * WMMA_M][k_step], BK + PAD);
+                }
+                #pragma unroll
+                for (int j = 0; j < FRAGS_N; ++j) {
+                    wmma::load_matrix_sync(b_frag[j], &sB[read_stage][k_step][warp_col + j * WMMA_N], BN + PAD);
+                }
+                #pragma unroll
+                for (int i = 0; i < FRAGS_M; ++i) {
+                    #pragma unroll
+                    for (int j = 0; j < FRAGS_N; ++j) {
+                        wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+                    }
+                }
+            }
         }
 
         __syncthreads();
         read_stage = write_stage;
     }
 
-    // ── Store accumulator to shared memory via WMMA ──
-    if (c_row < M && c_col < N) {
-        nvcuda::wmma::store_matrix_sync(
-            &sC[warp_m * WMMA_M][warp_n * WMMA_N],
-            c_frag, BLOCK_TILE_N, nvcuda::wmma::mem_row_major);
-    }
+    // --- Store back to Global Memory ---
+    #pragma unroll
+    for (int i = 0; i < FRAGS_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < FRAGS_N; ++j) {
+            const int c_r = block_row + warp_row + i * WMMA_M;
+            const int c_c = block_col + warp_col + j * WMMA_N;
 
-    __syncthreads();
+            if (c_r < M && c_c < N) {
+                #pragma unroll
+                for (int t = 0; t < c_frag[i][j].num_elements; t++) {
+                    c_frag[i][j].x[t] *= alpha;
+                }
 
-    // ── Vectorized epilogue: float4 stores from shared to global ──
-    // sC is 32×64 floats = 2048 floats. float4 = 4 floats → 512 float4 stores.
-    constexpr int SC_VEC_COUNT = (BLOCK_TILE_M * BLOCK_TILE_N) / 4;  // 512
-    for (int idx = tid; idx < SC_VEC_COUNT; idx += THREADS_PER_BLOCK) {
-        const int flat = idx * 4;
-        const int row  = flat / BLOCK_TILE_N;
-        const int col  = flat % BLOCK_TILE_N;
-        const int g_row = block_row + row;
-        const int g_col = block_col + col;
+                if (beta != 0.0f) {
+                    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_orig;
+                    wmma::load_matrix_sync(c_orig, C + c_r * N + c_c, N, wmma::mem_row_major);
+                    #pragma unroll
+                    for (int t = 0; t < c_frag[i][j].num_elements; t++) {
+                        c_frag[i][j].x[t] += beta * c_orig.x[t];
+                    }
+                }
 
-        if (g_row < M && (g_col + 4) <= N) {
-            float4 sc_val = reinterpret_cast<float4*>(&sC[row][col])[0];
-
-            if (beta != 0.0f) {
-                float4 c_val = reinterpret_cast<float4*>(&C[g_row * N + g_col])[0];
-                sc_val.x = alpha * sc_val.x + beta * c_val.x;
-                sc_val.y = alpha * sc_val.y + beta * c_val.y;
-                sc_val.z = alpha * sc_val.z + beta * c_val.z;
-                sc_val.w = alpha * sc_val.w + beta * c_val.w;
-            } else {
-                sc_val.x *= alpha;
-                sc_val.y *= alpha;
-                sc_val.z *= alpha;
-                sc_val.w *= alpha;
+                wmma::store_matrix_sync(C + c_r * N + c_c, c_frag[i][j], N, wmma::mem_row_major);
             }
-
-            reinterpret_cast<float4*>(&C[g_row * N + g_col])[0] = sc_val;
         }
     }
 }
@@ -195,14 +209,13 @@ __global__ void sgemm_tensor_core_vectorized_pipeline(
 
 void run_10_vectorized_tc(const __half* d_A, const __half* d_B, float* d_C, int M, int N, int K) {
     dim3 block(THREADS_PER_BLOCK);
-    dim3 grid((N + BLOCK_TILE_N - 1) / BLOCK_TILE_N,
-              (M + BLOCK_TILE_M - 1) / BLOCK_TILE_M);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     sgemm_tensor_core_vectorized_pipeline<<<grid, block>>>(d_A, d_B, d_C, M, N, K, 1.0f, 0.0f);
 }
 
 int main() {
-    int M = 2048, N = 2048, K = 2048;
-
+    int M = 4096, N = 4096, K = 4096;
+    
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     if (prop.major < 7) {
@@ -210,6 +223,6 @@ int main() {
         return 1;
     }
 
-    run_benchmark_half(run_10_vectorized_tc, M, N, K, "10_Vectorized_TC_Pipeline");
+    run_benchmark_half(run_10_vectorized_tc, M, N, K, "10_Vectorized_TC_Pipeline_4096");
     return 0;
 }
