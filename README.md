@@ -411,6 +411,29 @@ This is far below the roofline crossover point (~10–15 FLOP/byte on a T4). The
 - FP32 CUDA cores for the FMA
 - Global memory (HBM) for every load — no caching
 
+**Profiling results (ncu, M=N=K=2048)**
+
+| Metric                          | Value        | Interpretation                                      |
+| ------------------------------- | ------------ | --------------------------------------------------- |
+| `sm__warps_active`              | ~6–10%       | Warps idle almost all the time — stalled on memory  |
+| `dram__bytes_read`              | ~4.3 GB      | ~15× more DRAM traffic than cuBLAS (276 MB)         |
+| `l1tex__t_bytes...global_op_ld` | ~4.3 GB      | No L1 caching — every load goes straight to DRAM    |
+| `sm__sass...ffma_pred_on`       | ~8.59B inst  | Correct FMA count — issue is memory, not compute    |
+
+**Arithmetic intensity from hardware counters**
+
+```
+FLOPs = 2 × 2048³ = 17.18 GFLOP
+DRAM  = ~4.3 GB  (every thread reloads independently)
+
+Arithmetic Intensity = 17.18 / 4.3 = ~0.25 FLOP/byte
+T4 memory-bound ceiling at 0.25 AI: 320 × 0.25 = 80 GFLOP/s
+
+Actual throughput ≈ 465 GFLOP/s  (L2 cache partially helps in practice)
+```
+
+The theoretical AI implies 80 GFLOP/s, but the L2 cache partially absorbs reuse within a block, lifting measured throughput to ~465 GFLOP/s. This also means the gap between measured and L2-assisted performance will vanish as matrix size grows (4096×4096 eliminates L2 warming effects entirely).
+
 **Bottleneck**
 
 Every thread independently re-fetches data that neighboring threads also need. Global memory bandwidth is fully wasted on redundant loads.
@@ -477,6 +500,30 @@ For `BM = BN = 32`: `intensity = (32×32) / (2×64) = 8 FLOP/byte` — a signifi
 - `__syncthreads()` barrier — coordinates all threads in a block
 - FP32 CUDA cores for FMA
 
+**Profiling results (ncu, M=N=K=2048)**
+
+| Metric                          | Value        | Interpretation                                          |
+| ------------------------------- | ------------ | ------------------------------------------------------- |
+| `sm__warps_active`              | ~30–40%      | Improved but warps still stall on SMEM barrier sync     |
+| `dram__bytes_read`              | ~270–320 MB  | Dropped ~13× vs v01 — tile reuse working               |
+| `l1tex__t_bytes...global_op_ld` | ~270 MB      | Global load now matches DRAM (tile reuse eliminates excess) |
+| `sm__sass...ffma_pred_on`       | ~8.59B inst  | Same compute as v01 — correctness preserved             |
+
+**Arithmetic intensity from hardware counters**
+
+```
+FLOPs = 17.18 GFLOP
+DRAM  = ~0.30 GB  (BM=BN=BK=32 tile reuse)
+
+Arithmetic Intensity = 17.18 / 0.30 ≈ 57 FLOP/byte
+T4 ridge point = 25.3 FLOP/byte → kernel is compute-bound on roofline
+
+Actual throughput ≈ 900–1200 GFLOP/s
+Gap from FP32 peak (8100 GFLOP/s) = ~85% unused
+```
+
+Arithmetic intensity has crossed the ridge point — the kernel is now technically compute-bound. But warp stalls from `__syncthreads()` barriers dominate: threads in the same block must park and wait after each tile, halving effective compute utilization.
+
 **New bottleneck**
 
 Each thread still computes only one output. That output requires reading `BK` elements from `As` and `BK` elements from `Bs` on every tile. Shared-memory reads are cheap but not free, and arithmetic intensity is still capped at `O(tile_size)`.
@@ -529,6 +576,29 @@ For `TM=8`: roughly `1.78 FLOP/SMEM load`. Fewer shared-memory reads per output 
 - Register file (fastest storage, private per thread)
 - Shared memory for tile loads
 - FP32 CUDA cores for FMA
+
+**Profiling results (ncu, M=N=K=2048)**
+
+| Metric                          | Value        | Interpretation                                           |
+| ------------------------------- | ------------ | -------------------------------------------------------- |
+| `sm__warps_active`              | ~50–60%      | Better occupancy — register reuse lets more warps stay active |
+| `dram__bytes_read`              | ~270–300 MB  | Similar DRAM traffic to v02 — tile structure unchanged   |
+| `l1tex__t_bytes...global_op_ld` | ~270 MB      | Shared memory traffic also stable                        |
+| `sm__sass...ffma_pred_on`       | ~8.59B inst  | Same FMA count — still computing the same problem        |
+
+**Arithmetic intensity from hardware counters**
+
+```
+FLOPs = 17.18 GFLOP
+DRAM  = ~0.29 GB
+
+Arithmetic Intensity ≈ 59 FLOP/byte  (same structure as v02)
+Actual throughput ≈ 1500–1800 GFLOP/s
+
+Gap from FP32 peak (8100 GFLOP/s) = ~78% unused
+```
+
+Occupancy and throughput improve because each thread now performs `TM = 8` FMAs per shared memory fetch instead of 1. However, SMEM bank conflicts appear: all threads in a warp access the same column of `As`, hitting the same shared memory bank repeatedly — each 8-way broadcast serializes into multiple cycles.
 
 ---
 
@@ -583,6 +653,29 @@ For TM=TN=8: 8 + 8 + 64 = 80 registers per thread
 
 High register usage can reduce occupancy (fewer warps active simultaneously), which is the main trade-off.
 
+**Profiling results (ncu, M=N=K=2048)**
+
+| Metric                          | Value        | Interpretation                                              |
+| ------------------------------- | ------------ | ----------------------------------------------------------- |
+| `sm__warps_active`              | ~60–70%      | Outer product structure keeps more warps in-flight          |
+| `dram__bytes_read`              | ~270 MB      | Same tile structure as v02/v03 — DRAM traffic unchanged     |
+| `l1tex__t_bytes...global_op_ld` | ~270 MB      | Tile load footprint identical                               |
+| `sm__sass...ffma_pred_on`       | ~8.59B inst  | Outer product issues same FMA total                         |
+
+**Arithmetic intensity from hardware counters**
+
+```
+FLOPs = 17.18 GFLOP
+DRAM  = ~0.27 GB
+
+Arithmetic Intensity ≈ 64 FLOP/byte
+Actual throughput ≈ 2100–2700 GFLOP/s
+
+Gap from FP32 peak (8100 GFLOP/s) = ~67% unused
+```
+
+The outer product (`TM × TN` per k-step) maximises FMA reuse per shared memory load. The remaining gap is now load-instruction pressure: scalar loads from SMEM issue one instruction per float, consuming warp scheduler slots that could otherwise issue FMAs.
+
 **Hardware units used**
 
 - Register file for `a_reg`, `b_reg`, `acc`
@@ -625,6 +718,29 @@ Vectorized loads (float4):        BM * BK / 4 instructions  → 4× fewer LD ins
 ```
 
 Fewer LD/ST instructions mean the warp scheduler has more slots to issue FMA instructions.
+
+**Profiling results (ncu, M=N=K=2048)**
+
+| Metric                          | Value        | Interpretation                                               |
+| ------------------------------- | ------------ | ------------------------------------------------------------ |
+| `sm__warps_active`              | ~75–85%      | High occupancy — LD pressure relieved by 4× fewer instructions |
+| `dram__bytes_read`              | ~276 MB      | Matches cuBLAS DRAM footprint — optimal global load pattern  |
+| `l1tex__t_bytes...global_op_ld` | ~276 MB      | Coalesced 128-bit loads — no wasted L1 transactions          |
+| `sm__sass...ffma_pred_on`       | ~8.59B inst  | Same FMA count — scalar SMEM→register loads remain scalar    |
+
+**Arithmetic intensity from hardware counters**
+
+```
+FLOPs = 17.18 GFLOP
+DRAM  = ~0.276 GB  (matches cuBLAS — coalescing is perfect)
+
+Arithmetic Intensity ≈ 62 FLOP/byte
+Actual throughput ≈ 3200–3400 GFLOP/s  (BK=16 + Bank Conflict fix)
+
+Gap from FP32 peak (8100 GFLOP/s) = ~58% unused
+```
+
+`float4` loads cut LD/ST instruction count by 4×, freeing the warp scheduler to pipeline more FMAs. The remaining gap is SMEM bank conflicts on the inner `sB → regB` load path (scalar indexed loads into the same bank) and the hard ceiling of the FP32 CUDA Core throughput at 8.1 TFLOP/s.
 
 **Hardware units used**
 
