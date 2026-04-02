@@ -6,8 +6,6 @@ A correct GEMM kernel is easy to write. A fast one is not. This repository trace
 
 Each kernel version isolates one structural change, explains the bottleneck it targets, and documents what becomes the next limiting factor.
 
-![NVIDIA Turing Architecture Reference](img/GPU-architecture.jpg)
-
 ---
 
 ## Table of Contents
