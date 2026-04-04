@@ -10,7 +10,7 @@ Throughout this project, we iterate through a rigorous diagnostic loop:
 
 Each kernel version isolates one specific microarchitectural bottleneck, explains the theory behind the intervention, and formally measures the resulting shift in execution efficiency.
 
----
+## If you prefer to read more detail in medium, you can access the link: https://medium.com/@minhdrake/cublas-worklog-hardware-aware-gemm-optimization-for-nvidia-tensor-cores-ddf2712a6a33
 
 ## Table of Contents
 
